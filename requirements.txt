@@ -66,19 +66,20 @@ six==1.17.0
 sympy==1.13.3
 tensorboard==2.13.0
 tensorboard-data-server==0.7.2
-tensorflow==2.13.0
+#tensorflow==2.13.0
 tensorflow-estimator==2.13.0
 tensorflow-io-gcs-filesystem==0.34.0
 termcolor==2.4.0
 thop==0.1.1.post2209072238
-torch==2.4.1
+#torch==2.4.1
+torch<=2.3.0
 torchvision==0.19.1
 tqdm==4.67.1
 triton==3.0.0
-typing_extensions==4.5.0
+#typing_extensions==4.5.0
 tzdata==2025.2
 # Editable install with no version control (ultralytics==8.0.49)
--e /home/24181214123/yolo
+#-e /home/24181214123/yolo
 ultralytics-thop==2.0.14
 unrar==0.4
 urllib3==2.2.3

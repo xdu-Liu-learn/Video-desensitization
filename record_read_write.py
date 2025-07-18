@@ -39,7 +39,7 @@ def get_proto_descriptor(msg):
         return None
 
 def extract_camera_data(record_path, output_dir):
-    """高效解包摄像头数据到指定目录"""
+    """解包摄像头数据到指定目录"""
     os.makedirs(output_dir, exist_ok=True)
     camera_channels = {}
     camera_timestamps = defaultdict(list)  # 记录每个通道的时间戳
@@ -99,7 +99,7 @@ def extract_camera_data(record_path, output_dir):
     return len(camera_channels), camera_timestamps
 
 def split_h265_frames(data):
-    """更高效的H.265帧分割实现"""
+    """H.265帧分割实现"""
     if not data:
         return []
     
@@ -133,8 +133,8 @@ def split_h265_frames(data):
     return frames
 
 def repack_record(original_record, blurred_dir, hevc_dir, output_record):
-    """高效重新打包record文件"""
-    # 1. 加载时间戳信息
+    """重新打包record文件"""
+    #加载时间戳信息
     timestamps_path = os.path.join(hevc_dir, 'timestamps.pkl')
     if not os.path.exists(timestamps_path):
         raise FileNotFoundError(f"时间戳信息文件不存在: {timestamps_path}")
@@ -142,7 +142,7 @@ def repack_record(original_record, blurred_dir, hevc_dir, output_record):
     with open(timestamps_path, 'rb') as f:
         original_timestamps = pickle.load(f)
     
-    # 2. 准备脱敏视频数据
+    #准备脱敏视频数据
     video_data = {}
     for file in os.listdir(blurred_dir):
         if file.endswith('.h265'):
@@ -182,7 +182,7 @@ def repack_record(original_record, blurred_dir, hevc_dir, output_record):
             except Exception as e:
                 logging.error(f"处理视频文件失败 {file_path}: {e}")
     
-    # 3. 创建新record并写入数据
+    #创建新record并写入数据
     with Record(output_record, mode='w') as new_record:
         total_messages = 0
         camera_messages = 0
@@ -191,7 +191,7 @@ def repack_record(original_record, blurred_dir, hevc_dir, output_record):
         # 为每个通道创建帧指针
         frame_pointers = {channel: 0 for channel in video_data}
         
-        # 4. 处理原始record中的消息
+        #处理原始record中的消息
         with Record(original_record, mode='r') as orig_record:
             for topic, msg, t in tqdm(orig_record.read_messages(), desc="处理消息"):
                 try:
@@ -250,7 +250,7 @@ def repack_record(original_record, blurred_dir, hevc_dir, output_record):
                 except Exception as e:
                     logging.error(f"处理消息失败 ({topic}, t={t}): {e}")
     
-    # 5. 记录未使用的脱敏帧
+    # 记录未使用的脱敏帧
     for channel, ptr in frame_pointers.items():
         frames = video_data[channel]
         unused = len(frames) - ptr
@@ -262,28 +262,28 @@ def repack_record(original_record, blurred_dir, hevc_dir, output_record):
     logging.info(f"其他消息: {other_messages}")
     return total_messages
 
-def main():
-    # 配置路径
-    original_record = "e:\\样例\\样例\\2025-04-20_17-21-12.record.00002.17-22-22"
-    hevc_dir = "hevcs3"
-    blurred_dir = "E:\\face\\Blured"
-    final_record = "output_final.record"
+# def main():
+#     # 配置路径
+#     original_record = "e:\\样例\\样例\\2025-04-20_17-21-12.record.00002.17-22-22"
+#     hevc_dir = "hevcs3"
+#     blurred_dir = "E:\\face\\Blured"
+#     final_record = "output_final.record"
     
-    # 步骤1: 解包摄像头数据
-    logging.info("开始解包数据...")
-    camera_count, timestamps = extract_camera_data(original_record, hevc_dir)
-    logging.info(f"解包完成: {camera_count} 个摄像头通道")
+#     # 步骤1: 解包摄像头数据
+#     logging.info("开始解包数据...")
+#     camera_count, timestamps = extract_camera_data(original_record, hevc_dir)
+#     logging.info(f"解包完成: {camera_count} 个摄像头通道")
     
-    # 步骤2: 重新打包record
-    logging.info("开始重新打包record文件...")
-    repack_record(
-        original_record=original_record,
-        blurred_dir=blurred_dir,
-        hevc_dir=hevc_dir,
-        output_record=final_record
-    )
-    logging.info(f"打包完成: {final_record}")
+#     # 步骤2: 重新打包record
+#     logging.info("开始重新打包record文件...")
+#     repack_record(
+#         original_record=original_record,
+#         blurred_dir=blurred_dir,
+#         hevc_dir=hevc_dir,
+#         output_record=final_record
+#     )
+#     logging.info(f"打包完成: {final_record}")
 
-if __name__ == "__main__":
-    main()
-    #截断分割
+# if __name__ == "__main__":
+#     main()
+#     #截断分割

@@ -557,7 +557,7 @@ if __name__ == "__main__":
         input_videos_dir = config['input_videos_dir']
         output_videos_dir = config['output_videos_dir']
         temp_directory_base = config['temp_directory_base']
-        final_record = config['final_record']
+        final_record = config['final_record']  #新增打包路径
         video_formats = config['video_formats']
         cleanup_temp = config['cleanup_temp']
         copy_unprocessed = config['copy_unprocessed']
@@ -641,7 +641,8 @@ if __name__ == "__main__":
             else:
                 logger.info(f"跳过不符合格式的文件")
                 skip_count += 1
-       
+
+        #record文件打包
         logging.info("开始重新打包record文件...")
         repack_record(
             original_record=record_dir,

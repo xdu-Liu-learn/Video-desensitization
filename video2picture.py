@@ -141,11 +141,11 @@ def batch_convert_videos(input_dir, output_parent_dir, format='jpg'):
     
     print(f"\n所有视频处理完成！共保存了 {total_frames} 张图片")
 
-if __name__ == "__main__":
-    # 配置参数
-    INPUT_DIR = "C:\\Users\\Sprite\\Desktop\\hevcs\\video_2"  # 使用原始字符串表示Windows路径
-    OUTPUT_DIR = "video2picture"  # 输出父文件夹
-    IMAGE_FORMAT = "jpg"  # 输出图片格式(jpg/png)
+# if __name__ == "__main__":
+#     # 配置参数
+#     INPUT_DIR = "C:\\Users\\Sprite\\Desktop\\hevcs\\video_2"  # 使用原始字符串表示Windows路径
+#     OUTPUT_DIR = "video2picture"  # 输出父文件夹
+#     IMAGE_FORMAT = "jpg"  # 输出图片格式(jpg/png)
     
-    # 执行批量转换
-    batch_convert_videos(INPUT_DIR, OUTPUT_DIR, IMAGE_FORMAT)
+#     # 执行批量转换
+#     batch_convert_videos(INPUT_DIR, OUTPUT_DIR, IMAGE_FORMAT)

@@ -14,6 +14,7 @@ from utils import batch_convert_videos, convert_video_to_frames  # 导入视频�
 from utils import create_video  # 导入图片转视频函数
 import logging
 import sys
+from record_read_write import extract_camera_data,repack_record #record文件解包和打包
 
 # 配置全局日志器
 def setup_logger(log_file='video_processing.log'):
@@ -552,18 +553,22 @@ if __name__ == "__main__":
         
         # 获取配置参数
         plate_model_path = config['model_weights']
+        record_dir = config['record_dir']   #新增record文件路径
         input_videos_dir = config['input_videos_dir']
         output_videos_dir = config['output_videos_dir']
         temp_directory_base = config['temp_directory_base']
+        final_record = config['final_record']
         video_formats = config['video_formats']
         cleanup_temp = config['cleanup_temp']
         copy_unprocessed = config['copy_unprocessed']
         
         logger.info("配置参数:")
         logger.info(f"模型权重: {plate_model_path}")
+        logger.info(f"record输入: {record_dir}")
         logger.info(f"输入目录: {input_videos_dir}")
         logger.info(f"输出目录: {output_videos_dir}")
         logger.info(f"临时目录: {temp_directory_base}")
+        logger.info(f"record打包: {final_record}")
         logger.info(f"支持格式: {', '.join(video_formats)}")
         
         # 确保目录存在
@@ -571,6 +576,12 @@ if __name__ == "__main__":
         logger.info(f"输出目录已创建/确认: {output_videos_dir}")
         os.makedirs(temp_directory_base, exist_ok=True)
         logger.info(f"临时根目录已创建/确认: {temp_directory_base}")
+        
+        #解包record文件，获取摄像头数据
+        logging.info("开始解包数据...")
+        camera_count, timestamps = extract_camera_data(record_dir, input_videos_dir)
+        logging.info(f"解包完成: {camera_count} 个摄像头通道")
+
         
         # 开始文件处理
         logger.info(f"在目录 {input_videos_dir} 中查找文件...")
@@ -630,6 +641,15 @@ if __name__ == "__main__":
             else:
                 logger.info(f"跳过不符合格式的文件")
                 skip_count += 1
+       
+        logging.info("开始重新打包record文件...")
+        repack_record(
+            original_record=record_dir,
+            blurred_dir=output_videos_dir,
+            hevc_dir=input_videos_dir,
+            output_record=final_record
+            )
+        logging.info(f"打包完成: {final_record}")
         
         # 最终统计信息
         logger.info("\n===== 处理完成! 最终统计 =====")

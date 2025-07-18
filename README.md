@@ -7,6 +7,8 @@ Blur the faces and license plates in the video.
     pip install -r requirements.txt
     pip install --upgrade "tensorflow<=2.13.0"
     pip install ultralytics
+    pip install cyber_record,protobuf
+    pip install pickle
 
 # Install ffmpeg for decoding and encoding
     sudo apt-get update

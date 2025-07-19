@@ -18,29 +18,9 @@ from record_read_write import extract_camera_data,repack_record #record文件解
 
 # 配置全局日志器
 def setup_logger(log_file='video_processing.log'):
+    # 创建 logger 实例
     logger = logging.getLogger('VideoProcessor')
     logger.setLevel(logging.DEBUG)
-    
-    # 日志文件处理器
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    
-    # 控制台处理器
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    
-    # 详细日志格式
-    log_format = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s\n%(pathname)s:%(lineno)d\n---',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    
-    file_handler.setFormatter(log_format)
-    console_handler.setFormatter(log_format)
-    
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    
     return logger
     
 class CombinedProcessor:
@@ -188,7 +168,7 @@ class CombinedProcessor:
         output_path = os.path.join(self.output_dir, filename)
         cv2.imwrite(output_path, img)
         
-        logger.info(f"已处理: {filename} | 人脸: {faces_count} | 车牌: {plates_count}")
+        self.logger.info(f"已处理: {filename} | 人脸: {faces_count} | 车牌: {plates_count}")
         self.logger.info(f"图片处理完成 | 文件名: {filename} | 人脸: {faces_count} | 车牌: {plates_count} | 总耗时: {face_time+plate_time:.4f}s")
         return True
 
@@ -399,9 +379,16 @@ def load_config(config_file='config.ini'):
         raise ValueError(f"配置文件中缺少 [PATHS] 部分: {config_file}")
     
     paths = config['PATHS']
-    required_keys = ['model_weights', 'input_videos_dir', 'output_videos_dir', 'temp_directory_base']
-    missing = [key for key in required_keys if key not in paths]
+    required_keys = [
+        'model_weights', 
+        'record_dir',       # 新增
+        'input_videos_dir', 
+        'output_videos_dir', 
+        'temp_directory_base',
+        'final_record'      # 新增
+    ]
     
+    missing = [key for key in required_keys if key not in paths]
     if missing:
         raise ValueError(f"配置文件中缺少必要的键: {', '.join(missing)}")
     
@@ -413,15 +400,17 @@ def load_config(config_file='config.ini'):
         cleanup_temp = settings.getboolean('cleanup_temp', True)
         copy_unprocessed = settings.getboolean('copy_unprocessed_videos', True)
     else:
-        video_formats = ['h265', 'hevc', '265', 'mp4', 'mov', 'avi'] #如果配置文件未设置则启用默认的格式
+        video_formats = ['h265', 'hevc', '265', 'mp4', 'mov', 'avi']
         cleanup_temp = True
         copy_unprocessed = True
     
     return {
         'model_weights': paths['model_weights'],
+        'record_dir': paths['record_dir'],           # 新增
         'input_videos_dir': paths['input_videos_dir'],
         'output_videos_dir': paths['output_videos_dir'],
         'temp_directory_base': paths['temp_directory_base'],
+        'final_record': paths['final_record'],       # 新增
         'video_formats': video_formats,
         'cleanup_temp': cleanup_temp,
         'copy_unprocessed': copy_unprocessed
@@ -669,5 +658,10 @@ if __name__ == "__main__":
         logger.info("程序正常结束")
         
     except Exception as e:
-        logger.exception("程序发生致命错误:")
+        import traceback
+        print("="*50)
+        print("发生未捕获的异常:")
+        traceback.print_exc()
+        print("="*50)
+        logger.exception("程序发生致命错误:")  # 确保logger已初始化
         sys.exit(1)

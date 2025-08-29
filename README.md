@@ -2,13 +2,19 @@
 Blur the faces and license plates in the video.
 
 # Environment configuration
-    conda create -n FLPR python==3.8
-    conda activate FLPR
+    #GPU RTX5090算力过高，目前适配cuda12.8以及torch2.7版本
+    conda  create -n FLPR python=3.10
+    pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
     pip install -r requirements.txt
-    pip install --upgrade "tensorflow<=2.13.0"
+    wget https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.4.11/flash_attn-2.8.3+cu128torch2.7-cp310-cp310-linux_x86_64.whl
+    pip install flash_attn-2.8.3+cu128torch2.7-cp310-cp310-linux_x86_64.whl
+    pip install tensorflow==2.11.0
+    pip install cyber_record
     pip install ultralytics
-    pip install cyber_record,protobuf
-    pip install pickle
+    python combine_detect.py
+
+conda install -c nvidia cudnn=9.7.1.26
+
 
 # Install ffmpeg for decoding and encoding
     sudo apt-get update

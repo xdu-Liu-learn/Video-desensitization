@@ -245,8 +245,8 @@ def repack_record(original_record, blurred_dir, hevc_dir, output_record):
                     total_messages += 1
                     
                     # 定期刷新写入缓冲区
-                    if total_messages % 1000 == 0:
-                        new_record._writer.flush()
+                    #if total_messages % 1000 == 0:
+                        # new_record._writer.flush()  #会导致重复写入
                 except Exception as e:
                     logging.error(f"处理消息失败 ({topic}, t={t}): {e}")
     
@@ -287,3 +287,4 @@ def repack_record(original_record, blurred_dir, hevc_dir, output_record):
 # if __name__ == "__main__":
 #     main()
 #     #截断分割
+

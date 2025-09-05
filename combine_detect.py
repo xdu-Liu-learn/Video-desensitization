@@ -173,34 +173,12 @@ class CombinedProcessor:
         return True
 
 #def batch_process_images(input_dir, output_dir):
-def batch_process_images(input_dir, output_dir, plate_model_path):  # 修改函数参数
-    """批量处理目录中的所有图片"""
+def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
+    """批量处理目录中的所有图片（使用预加载的模型）"""
     logger = logging.getLogger('VideoProcessor.batch_process_images')
     logger.info("批量处理图片开始...")
     
-    # 初始化模型
-#    logger.info("初始化模型...")
-#    face_detector = MTCNN()
-##    plate_detector = YOLO('/home/24181214123/yolo/best.pt')  # 替换为你的模型路径
-#    plate_detector = YOLO(plate_model_path)  # 使用传入的模型路径
-
-    logger.info("初始化人脸检测模型 (MTCNN)...")
-    try:
-        face_detector = MTCNN()
-        logger.info("人脸检测模型初始化成功")
-    except Exception as e:
-        logger.exception("人脸检测模型初始化失败")
-        return
-    
-    logger.info(f"初始化车牌检测模型 (YOLO): {plate_model_path}")
-    try:
-        plate_detector = YOLO(plate_model_path)
-        logger.info("车牌检测模型初始化成功")
-    except Exception as e:
-        logger.exception("车牌检测模型初始化失败")
-        return 
-    
-    # 创建处理器实例
+    # 直接使用预加载的模型
     processor = CombinedProcessor(face_detector, plate_detector, output_dir)
     
     # 获取图片
@@ -234,12 +212,13 @@ def batch_process_images(input_dir, output_dir, plate_model_path):  # 修改函�
         os.startfile(output_dir)
 
 #def process_video_pipeline(input_video_path, output_video_path, temp_dir="temp_processing", fps=30):
-def process_video_pipeline(input_video_path, output_video_path, plate_model_path, temp_dir="temp_processing", fps=60):  # 修改函数参数
+def process_video_pipeline(input_video_path, output_video_path, face_detector, plate_detector, temp_dir="temp_processing", fps=60):
     """
     完整的视频处理流程：视频 -> 图片 -> 人脸车牌处理 -> 图片 -> 视频
     :param input_video_path: 输入视频文件路径
     :param output_video_path: 输出视频文件路径
-    :param plate_model_path: YOLO模型路径
+    :param face_detector: 预加载的人脸检测模型
+    :param plate_detector: 预加载的车牌检测模型
     :param temp_dir: 临时处理目录
     :param fps: 视频帧率
     :return: 处理是否成功
@@ -272,9 +251,8 @@ def process_video_pipeline(input_video_path, output_video_path, plate_model_path
     
     logger.info(f"步骤 2/4: 处理图片中的人脸和车牌")
     # 处理图片帧（人脸和车牌打码）
-#    batch_process_images(frame_dir, processed_dir)
     start_time = time.time()
-    batch_process_images(frame_dir, processed_dir, plate_model_path)  # 传递模型路径
+    batch_process_images(frame_dir, processed_dir, face_detector, plate_detector)  # 使用预加载模型
     process_time = time.time() - start_time
     logger.info(f"图片处理完成 | 耗时: {process_time:.2f}秒 | 平均每帧: {process_time/max(1, frame_count):.4f}秒")
     
@@ -302,9 +280,9 @@ def process_video_pipeline(input_video_path, output_video_path, plate_model_path
     return True
 
 # 新函数：处理单个视频文件
-def process_single_video(video_path, output_videos_dir, plate_model_path, temp_base_dir, cleanup=True):
+def process_single_video(video_path, output_videos_dir, face_detector, plate_detector, temp_base_dir, cleanup=True):
     """
-    处理单个视频的完整流程
+    处理单个视频的完整流程（使用预加载的模型）
     """
     logger = logging.getLogger('VideoProcessor.single_video')
     video_filename = os.path.basename(video_path)
@@ -334,7 +312,8 @@ def process_single_video(video_path, output_videos_dir, plate_model_path, temp_b
     success = process_video_pipeline(
         input_video_path=video_path,
         output_video_path=output_video_path,
-        plate_model_path=plate_model_path,
+        face_detector=face_detector,
+        plate_detector=plate_detector,
         temp_dir=video_temp_dir,
         fps=60
     )
@@ -560,6 +539,23 @@ if __name__ == "__main__":
         logger.info(f"record打包: {final_record}")
         logger.info(f"支持格式: {', '.join(video_formats)}")
         
+        # 在主函数中初始化模型，避免重复加载
+        logger.info("开始初始化检测模型...")
+        start_init_time = time.time()
+        
+        # 初始化MTCNN人脸检测模型
+        logger.info("正在加载MTCNN人脸检测模型...")
+        face_detector = MTCNN()
+        logger.info("MTCNN人脸检测模型加载完成")
+        
+        # 初始化YOLOv8车牌检测模型
+        logger.info("正在加载YOLOv8车牌检测模型...")
+        plate_detector = YOLO(plate_model_path)
+        logger.info("YOLOv8车牌检测模型加载完成")
+        
+        init_time = time.time() - start_init_time
+        logger.info(f"模型初始化完成，总耗时: {init_time:.2f}秒")
+        
         # 确保目录存在
         os.makedirs(output_videos_dir, exist_ok=True)
         logger.info(f"输出目录已创建/确认: {output_videos_dir}")
@@ -611,7 +607,7 @@ if __name__ == "__main__":
                 logger.info(f"处理视频文件 (.{file_ext})")
                 success = process_single_video(
                     file_path, output_videos_dir, 
-                    plate_model_path, temp_directory_base, cleanup_temp
+                    face_detector, plate_detector, temp_directory_base, cleanup_temp
                 )
                 if success:
                     success_count += 1

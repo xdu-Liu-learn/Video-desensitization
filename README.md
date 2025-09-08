@@ -10,10 +10,10 @@ Blur the faces and license plates in the video.
     pip install flash_attn-2.8.3+cu128torch2.7-cp310-cp310-linux_x86_64.whl
     pip install tensorflow==2.11.0
     pip install cyber_record
+    pip install av
     pip install ultralytics
     python combine_detect.py
-
-conda install -c nvidia cudnn=9.7.1.26
+    conda install -c nvidia cudnn=9.7.1.26
 
 
 # Install ffmpeg for decoding and encoding

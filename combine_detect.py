@@ -14,9 +14,7 @@ from utils import batch_convert_videos, convert_video_to_frames  # 导入视频�
 from utils import create_video  # 导入图片转视频函数
 import logging
 import sys
-#from record_read_write import extract_camera_data,repack_record #record文件解包和打包
-from foreign import readPacket
-from foreign import recordDeal
+from record_read_write import extract_camera_data,repack_record #record文件解包和打包
 
 # 配置全局日志器
 def setup_logger(log_file='video_processing.log'):
@@ -108,75 +106,102 @@ class CombinedProcessor:
         return img
 
     def detect_faces(self, img):
-        """检测人脸并应用马赛克"""
-        self.logger.debug("开始检测人脸...")
+        """检测人脸并打码（已废弃，使用批处理方法）"""
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-#        faces = self.face_detector.detect_faces(img_rgb)
-        
-        start_time = time.time()
         faces = self.face_detector.detect_faces(img_rgb)
-        face_detection_time = time.time() - start_time
-        
-        faces_count = len(faces)
-        self.logger.info(f"检测到 {faces_count} 张人脸 | 耗时: {face_detection_time:.4f}s")
         
         for face in faces:
             center, axes = self.get_optimal_ellipse(face, img.shape)
-            self.logger.debug(f"应用椭圆马赛克 - 位置: {center}, 轴长: {axes}")
             img = self.mosaic_ellipse_region(img, center, axes)
         
-        return img, len(faces), face_detection_time
+        return img, len(faces), 0
 
     def detect_plates(self, img):
-        """检测车牌并应用马赛克"""
-        # 使用YOLOv8检测车牌
-        self.logger.debug("开始检测车牌...")
-        start_time = time.time()
+        """检测车牌并打码（已废弃，使用批处理方法）"""
         results = self.plate_detector(img)
-        car_detection_time = time.time() - start_time
-
-        
         plates_count = 0
+        
         for result in results:
             boxes = result.boxes
+            plates_count += len(boxes)
             for box in boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy().squeeze().tolist())
                 img = self.mosaic_rectangle_region(img, x1, y1, x2, y2)
-                plates_count += 1
-                self.logger.debug(f"检测到车牌 #{plates_count} - 坐标: ({x1},{y1})-({x2},{y2})")
-
-        self.logger.info(f"检测到 {plates_count} 个车牌 | 耗时: {car_detection_time:.4f}s")
-        return img, plates_count, car_detection_time
+        
+        return img, plates_count, 0
 
     def process_image(self, img_path):
-        """处理单张图片"""
-        self.logger.debug(f"开始处理图片: {img_path}")
-        img = cv2.imread(img_path)
-        if img is None:
-#            logger.info(f"无法读取图片: {img_path}")
-            self.logger.error(f"无法读取图片: {img_path}")
-            return False
-        
-        original_img = img.copy()
-        
-# 处理人脸（接收耗时变量）
-        img, faces_count, face_time = self.detect_faces(img)  # 添加第三个返回值
+        """处理单张图片（已废弃，使用批处理方法）"""
+        return self.process_images_batch([img_path])
     
-    # 处理车牌（接收耗时变量）
-        img, plates_count, plate_time = self.detect_plates(img)  # 添加第三个返回值
+    def process_images_batch(self, img_paths):
+        """批量处理图片列表"""
+        if not img_paths:
+            return 0, 0, 0
+            
+        total_faces = 0
+        total_plates = 0
+        processed_count = 0
         
-        # 保存结果
-        filename = os.path.basename(img_path)
-        output_path = os.path.join(self.output_dir, filename)
-        cv2.imwrite(output_path, img)
+        # 批量读取图片
+        images = []
+        valid_paths = []
         
-        self.logger.info(f"已处理: {filename} | 人脸: {faces_count} | 车牌: {plates_count}")
-        self.logger.info(f"图片处理完成 | 文件名: {filename} | 人脸: {faces_count} | 车牌: {plates_count} | 总耗时: {face_time+plate_time:.4f}s")
-        return True
+        for img_path in img_paths:
+            img = cv2.imread(img_path)
+            if img is not None:
+                images.append(img)
+                valid_paths.append(img_path)
+            else:
+                self.logger.error(f"无法读取图片: {img_path}")
+        
+        if not images:
+            return 0, 0, 0
+            
+        # 批量处理人脸检测
+        faces_results = []
+        for img in images:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            faces = self.face_detector.detect_faces(img_rgb)
+            faces_results.append(faces)
+            total_faces += len(faces)
+        
+        # 批量处理车牌检测
+        plates_results = []
+        for img in images:
+            results = self.plate_detector(img)
+            plates_count = 0
+            for result in results:
+                boxes = result.boxes
+                plates_count += len(boxes)
+            plates_results.append(plates_count)
+            total_plates += plates_count
+        
+        # 批量应用马赛克并保存
+        for i, (img, img_path, faces, plates_count) in enumerate(zip(images, valid_paths, faces_results, plates_results)):
+            # 处理人脸
+            for face in faces:
+                center, axes = self.get_optimal_ellipse(face, img.shape)
+                img = self.mosaic_ellipse_region(img, center, axes)
+            
+            # 处理车牌
+            for result in self.plate_detector(img):
+                boxes = result.boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy().squeeze().tolist())
+                    img = self.mosaic_rectangle_region(img, x1, y1, x2, y2)
+            
+            # 保存结果
+            filename = os.path.basename(img_path)
+            output_path = os.path.join(self.output_dir, filename)
+            cv2.imwrite(output_path, img)
+            processed_count += 1
+        
+        return processed_count, total_faces, total_plates
 
 #def batch_process_images(input_dir, output_dir):
 def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
-    """批量处理目录中的所有图片（使用预加载的模型）"""
+    """批量处理目录中的所有图片（使用预加载的模型，16张图片批处理）"""
     logger = logging.getLogger('VideoProcessor.batch_process_images')
     logger.info("批量处理图片开始...")
     
@@ -196,17 +221,26 @@ def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
     
     # 批量处理
     processed_count = 0
+    total_faces = 0
+    total_plates = 0
     start_time = time.time()
     
-    for i, img_path in enumerate(image_paths, 1):
-        logger.info(f"\n处理图片 ({i}/{len(image_paths)}): {img_path}")
-        if processor.process_image(img_path):
-            processed_count += 1
+    # 按16张图片为一批进行处理
+    batch_size = 16
+    for i in range(0, len(image_paths), batch_size):
+        batch_files = image_paths[i:i+batch_size]
+        batch_processed, batch_faces, batch_plates = processor.process_images_batch(batch_files)
+        
+        processed_count += batch_processed
+        total_faces += batch_faces
+        total_plates += batch_plates
+        logger.info(f"批次 {i//batch_size + 1} 处理完成: {batch_processed} 张图片")
     
     # 打印统计信息
     total_time = time.time() - start_time
     avg_time = total_time / len(image_paths) if image_paths else 0
     logger.info(f"\n处理完成! 共处理 {processed_count}/{len(image_paths)} 张图片")
+    logger.info(f"人脸总数: {total_faces} | 车牌总数: {total_plates}")
     logger.info(f"总耗时: {total_time:.2f}秒 | 平均每张: {avg_time:.2f}秒")
     
     # 处理完成后打开输出目录（仅限Windows）
@@ -216,7 +250,7 @@ def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
 #def process_video_pipeline(input_video_path, output_video_path, temp_dir="temp_processing", fps=30):
 def process_video_pipeline(input_video_path, output_video_path, face_detector, plate_detector, temp_dir="temp_processing", fps=60):
     """
-    完整的视频处理流程：视频 -> 图片 -> 人脸车牌处理 -> 图片 -> 视频
+    完整的视频处理流程：视频 -> 图片 -> 人脸车牌处理 -> 图片 -> 视频（使用16张批处理）
     :param input_video_path: 输入视频文件路径
     :param output_video_path: 输出视频文件路径
     :param face_detector: 预加载的人脸检测模型
@@ -226,65 +260,60 @@ def process_video_pipeline(input_video_path, output_video_path, face_detector, p
     :return: 处理是否成功
     """
 
-#    os.makedirs(temp_dir, exist_ok=True)
-#    # 创建临时目录结构
-#    frame_dir = os.path.join(temp_dir, "frames")
-#    processed_dir = os.path.join(temp_dir, "processed")
-#    os.makedirs(frame_dir, exist_ok=True)
-#    os.makedirs(processed_dir, exist_ok=True)
-
     logger = logging.getLogger('VideoProcessor.pipeline')
     logger.info(f"视频处理管道启动: {input_video_path} → {output_video_path}")
     
-    os.makedirs(temp_dir, exist_ok=True)
+    start_time = time.time()
+    
+    # 创建临时目录
     frame_dir = os.path.join(temp_dir, "frames")
     processed_dir = os.path.join(temp_dir, "processed")
-    os.makedirs(frame_dir, exist_ok=True)
-    os.makedirs(processed_dir, exist_ok=True)
+    for dir_path in [frame_dir, processed_dir]:
+        if os.path.exists(dir_path):
+            shutil.rmtree(dir_path)
+        os.makedirs(dir_path)
     logger.info(f"临时目录结构创建完成: {frame_dir}, {processed_dir}")
     
-    logger.info(f"步骤 1/4: 视频拆解为图片帧 ({input_video_path})")
-    # 转换视频为图片帧
+    # 视频转图片
+    extract_start = time.time()
     frame_count = convert_video_to_frames(input_video_path, frame_dir)
     if frame_count == 0:
         logger.error("错误: 视频拆解失败")
         return False
-    logger.info(f"成功拆解 {frame_count} 帧图片到 {frame_dir}")
+    extract_time = time.time() - extract_start
+    logger.info(f"视频转图片完成 | 拆解 {frame_count} 帧 | 耗时: {extract_time:.2f}秒")
     
-    logger.info(f"步骤 2/4: 处理图片中的人脸和车牌")
-    # 处理图片帧（人脸和车牌打码）
-    start_time = time.time()
-    batch_process_images(frame_dir, processed_dir, face_detector, plate_detector)  # 使用预加载模型
-    process_time = time.time() - start_time
-    logger.info(f"图片处理完成 | 耗时: {process_time:.2f}秒 | 平均每帧: {process_time/max(1, frame_count):.4f}秒")
+    # 处理图片（使用16张批处理）
+    process_start = time.time()
+    batch_process_images(frame_dir, processed_dir, face_detector, plate_detector)
+    process_time = time.time() - process_start
+    logger.info(f"图片批量处理完成 | 耗时: {process_time:.2f}秒 | 平均每帧: {process_time/max(1, frame_count):.4f}秒")
     
-    logger.info(f"步骤 3/4: 将处理后的图片合成为视频")
-    # 创建处理后的视频
-#    success = create_h265_video(processed_dir, output_video_path, fps)
-    # 替换原来的 create_h265_video 函数为新的通用 create_video 函数
-    start_time = time.time()
+    # 图片转视频
+    compile_start = time.time()
     success = create_video(processed_dir, output_video_path, fps)
-    video_time = time.time() - start_time
+    compile_time = time.time() - compile_start
     if not success:
-        logger.info("错误: 视频合成失败")
+        logger.error("错误: 视频合成失败")
         return False
-    logger.info(f"视频合成完成 | 耗时: {video_time:.2f}秒 | 输出: {output_video_path}")
+    logger.info(f"图片转视频完成 | 耗时: {compile_time:.2f}秒 | 输出: {output_video_path}")
     
-    logger.info(f"步骤 4/4: 清理临时文件")
-    # 清理临时文件（可选）
-    if os.path.exists(temp_dir):
-        logger.info(f"步骤 4/4: 清理临时文件 ({temp_dir})")
-        shutil.rmtree(temp_dir)
-        logger.info("临时文件清理完成")
+    # 清理临时文件
+    shutil.rmtree(temp_dir)
     
-    logger.info("视频处理管道完成!")
+    total_time = time.time() - start_time
+    logger.info(f"视频处理完成: {os.path.basename(input_video_path)} → {os.path.basename(output_video_path)} | "
+                f"总耗时: {total_time:.2f}秒 | "
+                f"抽帧: {extract_time:.2f}s | "
+                f"处理: {process_time:.2f}s | "
+                f"合成: {compile_time:.2f}s")
     
     return True
 
-# 新函数：处理单个视频文件
+# 新函数：处理单个视频文件（使用预加载的模型，16张批处理）
 def process_single_video(video_path, output_videos_dir, face_detector, plate_detector, temp_base_dir, cleanup=True):
     """
-    处理单个视频的完整流程（使用预加载的模型）
+    处理单个视频的完整流程（使用预加载的模型，16张批处理优化）
     """
     logger = logging.getLogger('VideoProcessor.single_video')
     video_filename = os.path.basename(video_path)
@@ -293,9 +322,10 @@ def process_single_video(video_path, output_videos_dir, face_detector, plate_det
     # 获取视频原始格式
     original_format = video_ext.lstrip('.').lower() if video_ext else ''
     logger.info(f"处理视频: {video_filename}")
+    
     # 如果无法确定格式，跳过处理
     if not original_format:
-        logger.info(f"警告: 无法确定视频格式: {video_filename}，将直接复制而不处理")
+        logger.warning(f"无法确定视频格式: {video_filename}，将直接复制而不处理")
         return False
     
     # 为每个视频创建唯一的输出文件名
@@ -329,7 +359,7 @@ def process_single_video(video_path, output_videos_dir, face_detector, plate_det
             logger.info(f"清理临时文件: {video_temp_dir}")
             shutil.rmtree(video_temp_dir)
     else:
-        logger.info("视频处理失败")
+        logger.error("视频处理失败")
     
     return success
 
@@ -363,10 +393,10 @@ def load_config(config_file='config.ini'):
     required_keys = [
         'model_weights', 
         'record_dir',       # 新增
-        'output_h265_dir',  #修改
+        'input_videos_dir', 
         'output_videos_dir', 
         'temp_directory_base',
-        'record_output_dir'      # 新增
+        'final_record'      # 新增
     ]
     
     missing = [key for key in required_keys if key not in paths]
@@ -388,10 +418,10 @@ def load_config(config_file='config.ini'):
     return {
         'model_weights': paths['model_weights'],
         'record_dir': paths['record_dir'],           # 新增
-        'output_h265_dir': paths['output_h265_dir'],  #修改
+        'input_videos_dir': paths['input_videos_dir'],
         'output_videos_dir': paths['output_videos_dir'],
         'temp_directory_base': paths['temp_directory_base'],
-        'record_output_dir': paths['record_output_dir'],       # 新增
+        'final_record': paths['final_record'],       # 新增
         'video_formats': video_formats,
         'cleanup_temp': cleanup_temp,
         'copy_unprocessed': copy_unprocessed
@@ -408,6 +438,103 @@ def process_mf4(file_path, output_dir):
     return True
 
 if __name__ == "__main__":
+#    # 配置参数
+#    input_video = "/home/24181214123/yolo/original_video/camera_front_narrow.h265"  # 输入视频文件
+#    output_video = "/home/24181214123/yolo/output_video.h265"  # 输出视频文件
+#    temp_directory = "/home/24181214123/yolo/temp_processing"  # 临时处理目录
+
+    
+#    all_files = []
+#    for root, _, files in os.walk(input_videos_dir):
+#        for file in files:
+#            all_files.append(os.path.join(root, file))
+#    
+#    if not all_files:
+#        logger.info("在指定目录中没有找到任何文件")
+#        exit(0)
+#    
+#    logger.info(f"找到 {len(all_files)} 个文件")
+#    
+##     # 执行完整处理流程
+##    start_time = time.time()
+##    success = process_video_pipeline(input_video, output_video, temp_directory)
+#
+#    
+##    if success:
+##        total_time = time.time() - start_time
+##        logger.info(f"\n处理完成! 输出视频: {output_video}")
+##        logger.info(f"总耗时: {total_time:.2f}秒")
+#
+#    # 开始处理文件
+#    total_start_time = time.time()
+#    success_count = 0
+#    copy_count = 0
+#    skip_count = 0
+#    mf4_count = 0
+#    
+#    for i, file_path in enumerate(all_files, 1):
+#        filename = os.path.basename(file_path)
+#        logger.info(f"\n=== 处理文件 ({i}/{len(all_files)}): {filename} ===")
+#        
+#        # 获取文件扩展名（小写，不含点）
+#        _, file_ext = os.path.splitext(filename)
+#        file_ext = file_ext.lstrip('.').lower() if file_ext else ''
+#        
+#        # 检查是否是要处理的视频文件
+#        if file_ext == 'mf4':
+#            # 特殊处理.mf4文件
+#            if process_mf4(file_path, output_videos_dir):
+#                mf4_count += 1
+#                logger.info(f".mf4 文件处理成功: {filename}")
+#            else:
+#                logger.info(f".mf4 文件处理失败: {filename}")
+#                skip_count += 1
+#        elif file_ext in video_formats:
+#            # 符合格式，进行马赛克处理
+#            success = process_single_video(
+#                video_path=file_path,
+#                output_videos_dir=output_videos_dir,
+#                plate_model_path=plate_model_path,
+#                temp_base_dir=temp_directory_base,
+#                cleanup=cleanup_temp
+#            )
+#            if success:
+#                success_count += 1
+#                logger.info(f"视频处理成功: {filename}")
+#            else:
+#                logger.info(f"视频处理失败: {filename}")
+#                skip_count += 1
+#        elif copy_unprocessed:
+#            # 不符合格式但配置了复制
+#            if copy_unprocessed_video(file_path, output_videos_dir):
+#                copy_count += 1
+#                logger.info(f"已复制未处理文件: {filename}")
+#            else:
+#                logger.info(f"复制文件失败: {filename}")
+#                skip_count += 1
+#        else:
+#            # 不符合格式且未配置复制
+#            logger.info(f"跳过不符合格式的文件: {filename}")
+#            skip_count += 1
+#
+#    # 打印总体统计信息
+#    total_time = time.time() - total_start_time
+#    logger.info(f"\n===== 所有文件处理完成! =====")
+#    logger.info(f"总文件数: {len(all_files)}")
+#    logger.info(f"特殊处理 .mf4 文件数: {mf4_count}")
+#    logger.info(f"成功处理视频数: {success_count}")
+#    logger.info(f"复制未处理文件数: {copy_count}")
+#    logger.info(f"跳过文件数: {skip_count}")
+#    logger.info(f"总耗时: {total_time:.2f}秒 | 平均每个文件: {total_time / max(1, len(all_files)):.2f}秒")
+#
+#        
+#    # 处理完成后打开输出目录（仅限Windows）
+#    if os.name == 'nt' and os.path.exists(output_video):
+#        output_dir = os.path.dirname(output_video) or '.'
+#        os.startfile(output_dir)
+#    else:
+#        logger.info("视频处理失败")
+
      # 初始化日志器 - 这是最重要的修改
     logger = setup_logger('video_processing.log')
     logger.info("===== 程序启动 =====")
@@ -427,22 +554,21 @@ if __name__ == "__main__":
         # 获取配置参数
         plate_model_path = config['model_weights']
         record_dir = config['record_dir']   #新增record文件路径
-        output_h265_dir = config['output_h265_dir']
+        input_videos_dir = config['input_videos_dir']
         output_videos_dir = config['output_videos_dir']
         temp_directory_base = config['temp_directory_base']
         final_record = config['final_record']  #新增打包路径
         video_formats = config['video_formats']
         cleanup_temp = config['cleanup_temp']
         copy_unprocessed = config['copy_unprocessed']
-        input_videos_dir = os.path.join(output_h265_dir, hevcs)
         
         logger.info("配置参数:")
         logger.info(f"模型权重: {plate_model_path}")
         logger.info(f"record输入: {record_dir}")
-        logger.info(f"视频输入目录: {input_videos_dir}")
-        logger.info(f"视频输出目录: {output_videos_dir}")
+        logger.info(f"输入目录: {input_videos_dir}")
+        logger.info(f"输出目录: {output_videos_dir}")
         logger.info(f"临时目录: {temp_directory_base}")
-        logger.info(f"record打包路径: {record_output_dir}")
+        logger.info(f"record打包: {final_record}")
         logger.info(f"支持格式: {', '.join(video_formats)}")
         
         # 在主函数中初始化模型，避免重复加载
@@ -470,11 +596,8 @@ if __name__ == "__main__":
         
         #解包record文件，获取摄像头数据
         logging.info("开始解包数据...")
-        result1 = recordDeal.read_record2h265_all(record_dir, output_h265_dir) #解包record文件，得到hevcs文件
-        
-        #camera_count, timestamps = extract_camera_data(record_dir, input_videos_dir)
-        logging.info(f"解包完成")
-        
+        camera_count, timestamps = extract_camera_data(record_dir, input_videos_dir)
+        logging.info(f"解包完成: {camera_count} 个摄像头通道")
 
         
         # 开始文件处理
@@ -538,14 +661,13 @@ if __name__ == "__main__":
 
         #record文件打包
         logging.info("开始重新打包record文件...")
-        #repack_record(
-            #original_record=record_dir,
-            #blurred_dir=output_videos_dir,
-           # hevc_dir=input_videos_dir,
-            #output_record=final_record
-           # )
-        result2 = recordDeal.write_allH265_record_all(record_dir, output_videos_dir,record_output_dir) #脱敏record文件，得到脱敏后的record文件
-        logging.info(f"打包完成")
+        repack_record(
+            original_record=record_dir,
+            blurred_dir=output_videos_dir,
+            hevc_dir=input_videos_dir,
+            output_record=final_record
+            )
+        logging.info(f"打包完成: {final_record}")
         
         # 最终统计信息
         logger.info("\n===== 处理完成! 最终统计 =====")

@@ -423,11 +423,11 @@ if __name__ == "__main__":
         output_h265_dir = config['output_h265_dir']
         output_videos_dir = config['output_videos_dir']
         temp_directory_base = config['temp_directory_base']
-        final_record = config['final_record']  #新增打包路径
+        record_output_dir = config['record_output_dir']  #新增打包路径
         video_formats = config['video_formats']
         cleanup_temp = config['cleanup_temp']
         copy_unprocessed = config['copy_unprocessed']
-        input_videos_dir = os.path.join(output_h265_dir, hevcs)
+        input_videos_dir = os.path.join(output_h265_dir, "hevcs")
         
         logger.info("配置参数:")
         logger.info(f"模型权重: {plate_model_path}")

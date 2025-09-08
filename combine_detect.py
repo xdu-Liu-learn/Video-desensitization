@@ -36,6 +36,13 @@ class CombinedProcessor:
         
         # 检查GPU使用情况
         self.check_gpu_usage()
+        
+        # 将模型迁移到GPU（如果可用）
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if torch.cuda.is_available():
+            self.logger.info(f"将模型迁移到GPU设备: {self.device}")
+            # YOLO模型已经在GPU上（由YOLO自动处理）
+            # MTCNN保持在CPU（仅支持CPU）
     
     def check_gpu_usage(self):
         """检查模型是否使用GPU运行"""
@@ -158,32 +165,88 @@ class CombinedProcessor:
         self.logger.info(f"检测到 {plates_count} 个车牌 | 耗时: {car_detection_time:.4f}s")
         return img, plates_count, car_detection_time
 
-    def process_image(self, img_path):
-        """处理单张图片"""
-        self.logger.debug(f"开始处理图片: {img_path}")
-        img = cv2.imread(img_path)
-        if img is None:
-#            logger.info(f"无法读取图片: {img_path}")
-            self.logger.error(f"无法读取图片: {img_path}")
-            return False
+    def process_images_batch(self, image_paths):
+        """批量处理多张图片（16张批处理优化）"""
+        if not image_paths:
+            return 0, 0, 0
+            
+        self.logger.debug(f"开始批量处理 {len(image_paths)} 张图片")
         
-        original_img = img.copy()
+        total_processed = 0
+        total_faces_processed = 0  # 实际经过马赛克处理的人脸数量
+        total_plates_processed = 0  # 实际经过马赛克处理的车牌数量
         
-# 处理人脸（接收耗时变量）
-        img, faces_count, face_time = self.detect_faces(img)  # 添加第三个返回值
+        # 批量读取图片
+        images = []
+        valid_paths = []
+        
+        for img_path in image_paths:
+            img = cv2.imread(img_path)
+            if img is not None:
+                images.append(img)
+                valid_paths.append(img_path)
+            else:
+                self.logger.error(f"无法读取图片: {img_path}")
+        
+        if not images:
+            return 0, 0, 0
+        
+        # 批量人脸检测
+        faces_results = []
+        for img in images:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            faces = self.face_detector.detect_faces(img_rgb)
+            faces_results.append(faces)
+        
+        # 批量车牌检测 - 使用GPU加速（静默模式）
+        plates_results = []
+        for img in images:
+            if torch.cuda.is_available():
+                # 使用GPU加速，关闭详细输出
+                results = self.plate_detector(img, device=self.device, verbose=False)
+            else:
+                results = self.plate_detector(img, verbose=False)
+            
+            plates_boxes = []
+            for result in results:
+                boxes = result.boxes
+                if boxes is not None:
+                    for box in boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy().squeeze().tolist())
+                        plates_boxes.append((x1, y1, x2, y2))
+            plates_results.append(plates_boxes)
+        
+        # 批量应用马赛克并保存
+        for i, (img, img_path, faces, plates) in enumerate(zip(images, valid_paths, faces_results, plates_results)):
+            faces_count = len(faces)
+            plates_count = len(plates)
+            
+            # 处理人脸（仅当有检测到人脸时）
+            if faces_count > 0:
+                for face in faces:
+                    center, axes = self.get_optimal_ellipse(face, img.shape)
+                    img = self.mosaic_ellipse_region(img, center, axes)
+                total_faces_processed += faces_count
+            
+            # 处理车牌（仅当有检测到车牌时）
+            if plates_count > 0:
+                for (x1, y1, x2, y2) in plates:
+                    img = self.mosaic_rectangle_region(img, x1, y1, x2, y2)
+                total_plates_processed += plates_count
+            
+            # 保存结果
+            filename = os.path.basename(img_path)
+            output_path = os.path.join(self.output_dir, filename)
+            cv2.imwrite(output_path, img)
+            
+            total_processed += 1
+            
+        # 移除单张图片的详细日志，只在批处理完成后输出汇总信息
+        
+        self.logger.info(f"批处理完成: {total_processed} 张图片, "
+                        f"人脸 {total_faces_processed} 个, 车牌 {total_plates_processed} 个")
+        return total_processed, total_faces_processed, total_plates_processed
     
-    # 处理车牌（接收耗时变量）
-        img, plates_count, plate_time = self.detect_plates(img)  # 添加第三个返回值
-        
-        # 保存结果
-        filename = os.path.basename(img_path)
-        output_path = os.path.join(self.output_dir, filename)
-        cv2.imwrite(output_path, img)
-        
-        self.logger.info(f"已处理: {filename} | 人脸: {faces_count} | 车牌: {plates_count}")
-        self.logger.info(f"图片处理完成 | 文件名: {filename} | 人脸: {faces_count} | 车牌: {plates_count} | 总耗时: {face_time+plate_time:.4f}s")
-        return True
-
 #def batch_process_images(input_dir, output_dir):
 def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
     """批量处理目录中的所有图片（使用16张批处理优化）"""
@@ -211,11 +274,10 @@ def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
     logger.info(f"开始批量处理 {total_images} 张图片（每批16张）")
     batch_start_time = time.time()
     
-    # 按16张图片为一批进行处理
+    # 按16张为一批进行处理（静默模式）
     for batch_start in range(0, total_images, batch_size):
         batch_end = min(batch_start + batch_size, total_images)
         batch_files = image_paths[batch_start:batch_end]
-        batch_num = batch_start // batch_size + 1
         
         # 批量处理当前批次
         batch_processed, batch_faces, batch_plates = processor.process_images_batch(batch_files)
@@ -223,9 +285,6 @@ def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
         total_processed += batch_processed
         total_faces += batch_faces
         total_plates += batch_plates
-        
-        logger.info(f"批次 {batch_num} 完成: {batch_processed}/{len(batch_files)} 张图片 | "
-                   f"人脸: {batch_faces} | 车牌: {batch_plates}")
     
     # 打印批处理统计信息
     batch_total_time = time.time() - batch_start_time
@@ -259,12 +318,13 @@ def process_video_pipeline(input_video_path, output_video_path, face_detector, p
         return False
     extract_time = time.time() - extract_start
     
-    # 使用16张批处理处理图片
-    process_start = time.time()
-    processed_frames, total_faces, total_plates = batch_process_images(
+    # 步骤2: 批处理图片
+    logger.info("步骤2: 批处理图片...")
+    batch_start = time.time()
+    processed_frames, total_faces_processed, total_plates_processed = batch_process_images(
         frame_dir, processed_dir, face_detector, plate_detector
     )
-    process_time = time.time() - process_start
+    batch_time = time.time() - batch_start
     
     # 将处理后的图片合成为视频
     compile_start = time.time()
@@ -281,12 +341,8 @@ def process_video_pipeline(input_video_path, output_video_path, face_detector, p
     # 计算总耗时并输出
     total_video_time = time.time() - video_start_time
     logger.info(f"视频处理完成: {os.path.basename(input_video_path)} → {os.path.basename(output_video_path)}")
-    logger.info(f"总耗时: {total_video_time:.2f}秒 | "
-                f"抽帧: {extract_time:.2f}s | "
-                f"批处理: {process_time:.2f}s | "
-                f"合成: {compile_time:.2f}s | "
-                f"帧数: {frame_count} | "
-                f"人脸: {total_faces} | 车牌: {total_plates}")
+    logger.info(f"总耗时: {total_video_time:.1f}s (抽帧 {extract_time:.1f}s | 批处理 {batch_time:.1f}s | 合成 {compile_time:.1f}s)")
+    logger.info(f"处理 {frame_count} 帧, 人脸 {total_faces_processed} 个, 车牌 {total_plates_processed} 个")
     
     return True
 
@@ -310,21 +366,27 @@ def process_single_video(video_path, output_videos_dir, face_detector, plate_det
         logger.warning(f"无法确定视频格式: {video_filename}，将直接复制而不处理")
         return False
     
+    # 创建处理器实例
+    processor = CombinedProcessor(face_detector, plate_detector, video_temp_dir)
+    
     # 使用处理管道（包含16张批处理优化和完整时间统计）
-    success = process_video_pipeline(
-        input_video_path=video_path,
-        output_video_path=output_video_path,
-        face_detector=face_detector,
-        plate_detector=plate_detector,
-        temp_dir=video_temp_dir,
-        fps=60
-    )
-    
-    # 清理临时文件
-    if cleanup and os.path.exists(video_temp_dir):
-        shutil.rmtree(video_temp_dir)
-    
-    return success
+    try:
+        processed_frames, faces_processed, plates_processed = process_video_pipeline(
+            video_path, output_videos_dir, processor, batch_size=16
+        )
+        
+        logger.info(f"视频处理成功: {video_filename} - "
+                   f"{processed_frames} 帧, "
+                   f"实际马赛克处理 {faces_processed} 人脸, {plates_processed} 车牌")
+        return True
+        
+    except Exception as e:
+        logger.error(f"处理视频 {video_filename} 时出错: {str(e)}")
+        return False
+    finally:
+        # 清理临时文件
+        if cleanup and os.path.exists(video_temp_dir):
+            shutil.rmtree(video_temp_dir)
 
 # 不需要处理的视频直接复制到输出目录中
 def copy_unprocessed_video(video_path, output_dir):

@@ -363,10 +363,10 @@ def load_config(config_file='config.ini'):
     required_keys = [
         'model_weights', 
         'record_dir',       # 新增
-        'input_videos_dir', 
+        'output_h265_dir',  #修改
         'output_videos_dir', 
         'temp_directory_base',
-        'final_record'      # 新增
+        'record_output_dir'      # 新增
     ]
     
     missing = [key for key in required_keys if key not in paths]
@@ -388,10 +388,10 @@ def load_config(config_file='config.ini'):
     return {
         'model_weights': paths['model_weights'],
         'record_dir': paths['record_dir'],           # 新增
-        'input_videos_dir': paths['input_videos_dir'],
+        'output_h265_dir': paths['output_h265_dir'],  #修改
         'output_videos_dir': paths['output_videos_dir'],
         'temp_directory_base': paths['temp_directory_base'],
-        'final_record': paths['final_record'],       # 新增
+        'record_output_dir': paths['record_output_dir'],       # 新增
         'video_formats': video_formats,
         'cleanup_temp': cleanup_temp,
         'copy_unprocessed': copy_unprocessed
@@ -427,21 +427,22 @@ if __name__ == "__main__":
         # 获取配置参数
         plate_model_path = config['model_weights']
         record_dir = config['record_dir']   #新增record文件路径
-        input_videos_dir = config['input_videos_dir']
+        output_h265_dir = config['output_h265_dir']
         output_videos_dir = config['output_videos_dir']
         temp_directory_base = config['temp_directory_base']
         final_record = config['final_record']  #新增打包路径
         video_formats = config['video_formats']
         cleanup_temp = config['cleanup_temp']
         copy_unprocessed = config['copy_unprocessed']
+        input_videos_dir = os.path.join(output_h265_dir, hevcs)
         
         logger.info("配置参数:")
         logger.info(f"模型权重: {plate_model_path}")
         logger.info(f"record输入: {record_dir}")
-        logger.info(f"输入目录: {input_videos_dir}")
-        logger.info(f"输出目录: {output_videos_dir}")
+        logger.info(f"视频输入目录: {input_videos_dir}")
+        logger.info(f"视频输出目录: {output_videos_dir}")
         logger.info(f"临时目录: {temp_directory_base}")
-        logger.info(f"record打包: {final_record}")
+        logger.info(f"record打包路径: {record_output_dir}")
         logger.info(f"支持格式: {', '.join(video_formats)}")
         
         # 在主函数中初始化模型，避免重复加载
@@ -469,10 +470,10 @@ if __name__ == "__main__":
         
         #解包record文件，获取摄像头数据
         logging.info("开始解包数据...")
-        result1 = recordDeal.read_record2h265_all(record_dir, output_dir1) #解包record文件，得到hevcs文件
+        result1 = recordDeal.read_record2h265_all(record_dir, output_h265_dir) #解包record文件，得到hevcs文件
         
         #camera_count, timestamps = extract_camera_data(record_dir, input_videos_dir)
-        #logging.info(f"解包完成: {camera_count} 个摄像头通道")
+        logging.info(f"解包完成")
         
 
         
@@ -537,13 +538,14 @@ if __name__ == "__main__":
 
         #record文件打包
         logging.info("开始重新打包record文件...")
-        repack_record(
-            original_record=record_dir,
-            blurred_dir=output_videos_dir,
-            hevc_dir=input_videos_dir,
-            output_record=final_record
-            )
-        logging.info(f"打包完成: {final_record}")
+        #repack_record(
+            #original_record=record_dir,
+            #blurred_dir=output_videos_dir,
+           # hevc_dir=input_videos_dir,
+            #output_record=final_record
+           # )
+        result2 = recordDeal.write_allH265_record_all(record_dir, output_videos_dir,record_output_dir) #脱敏record文件，得到脱敏后的record文件
+        logging.info(f"打包完成")
         
         # 最终统计信息
         logger.info("\n===== 处理完成! 最终统计 =====")

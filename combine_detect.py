@@ -14,7 +14,9 @@ from utils import batch_convert_videos, convert_video_to_frames  # 导入视频�
 from utils import create_video  # 导入图片转视频函数
 import logging
 import sys
-from record_read_write import extract_camera_data,repack_record #record文件解包和打包
+#from record_read_write import extract_camera_data,repack_record #record文件解包和打包
+from foreign import readPacket
+from foreign import recordDeal
 
 # 配置全局日志器
 def setup_logger(log_file='video_processing.log'):
@@ -406,103 +408,6 @@ def process_mf4(file_path, output_dir):
     return True
 
 if __name__ == "__main__":
-#    # 配置参数
-#    input_video = "/home/24181214123/yolo/original_video/camera_front_narrow.h265"  # 输入视频文件
-#    output_video = "/home/24181214123/yolo/output_video.h265"  # 输出视频文件
-#    temp_directory = "/home/24181214123/yolo/temp_processing"  # 临时处理目录
-
-    
-#    all_files = []
-#    for root, _, files in os.walk(input_videos_dir):
-#        for file in files:
-#            all_files.append(os.path.join(root, file))
-#    
-#    if not all_files:
-#        logger.info("在指定目录中没有找到任何文件")
-#        exit(0)
-#    
-#    logger.info(f"找到 {len(all_files)} 个文件")
-#    
-##     # 执行完整处理流程
-##    start_time = time.time()
-##    success = process_video_pipeline(input_video, output_video, temp_directory)
-#
-#    
-##    if success:
-##        total_time = time.time() - start_time
-##        logger.info(f"\n处理完成! 输出视频: {output_video}")
-##        logger.info(f"总耗时: {total_time:.2f}秒")
-#
-#    # 开始处理文件
-#    total_start_time = time.time()
-#    success_count = 0
-#    copy_count = 0
-#    skip_count = 0
-#    mf4_count = 0
-#    
-#    for i, file_path in enumerate(all_files, 1):
-#        filename = os.path.basename(file_path)
-#        logger.info(f"\n=== 处理文件 ({i}/{len(all_files)}): {filename} ===")
-#        
-#        # 获取文件扩展名（小写，不含点）
-#        _, file_ext = os.path.splitext(filename)
-#        file_ext = file_ext.lstrip('.').lower() if file_ext else ''
-#        
-#        # 检查是否是要处理的视频文件
-#        if file_ext == 'mf4':
-#            # 特殊处理.mf4文件
-#            if process_mf4(file_path, output_videos_dir):
-#                mf4_count += 1
-#                logger.info(f".mf4 文件处理成功: {filename}")
-#            else:
-#                logger.info(f".mf4 文件处理失败: {filename}")
-#                skip_count += 1
-#        elif file_ext in video_formats:
-#            # 符合格式，进行马赛克处理
-#            success = process_single_video(
-#                video_path=file_path,
-#                output_videos_dir=output_videos_dir,
-#                plate_model_path=plate_model_path,
-#                temp_base_dir=temp_directory_base,
-#                cleanup=cleanup_temp
-#            )
-#            if success:
-#                success_count += 1
-#                logger.info(f"视频处理成功: {filename}")
-#            else:
-#                logger.info(f"视频处理失败: {filename}")
-#                skip_count += 1
-#        elif copy_unprocessed:
-#            # 不符合格式但配置了复制
-#            if copy_unprocessed_video(file_path, output_videos_dir):
-#                copy_count += 1
-#                logger.info(f"已复制未处理文件: {filename}")
-#            else:
-#                logger.info(f"复制文件失败: {filename}")
-#                skip_count += 1
-#        else:
-#            # 不符合格式且未配置复制
-#            logger.info(f"跳过不符合格式的文件: {filename}")
-#            skip_count += 1
-#
-#    # 打印总体统计信息
-#    total_time = time.time() - total_start_time
-#    logger.info(f"\n===== 所有文件处理完成! =====")
-#    logger.info(f"总文件数: {len(all_files)}")
-#    logger.info(f"特殊处理 .mf4 文件数: {mf4_count}")
-#    logger.info(f"成功处理视频数: {success_count}")
-#    logger.info(f"复制未处理文件数: {copy_count}")
-#    logger.info(f"跳过文件数: {skip_count}")
-#    logger.info(f"总耗时: {total_time:.2f}秒 | 平均每个文件: {total_time / max(1, len(all_files)):.2f}秒")
-#
-#        
-#    # 处理完成后打开输出目录（仅限Windows）
-#    if os.name == 'nt' and os.path.exists(output_video):
-#        output_dir = os.path.dirname(output_video) or '.'
-#        os.startfile(output_dir)
-#    else:
-#        logger.info("视频处理失败")
-
      # 初始化日志器 - 这是最重要的修改
     logger = setup_logger('video_processing.log')
     logger.info("===== 程序启动 =====")
@@ -564,8 +469,11 @@ if __name__ == "__main__":
         
         #解包record文件，获取摄像头数据
         logging.info("开始解包数据...")
-        camera_count, timestamps = extract_camera_data(record_dir, input_videos_dir)
-        logging.info(f"解包完成: {camera_count} 个摄像头通道")
+        result1 = recordDeal.read_record2h265_all(record_dir, output_dir1) #解包record文件，得到hevcs文件
+        
+        #camera_count, timestamps = extract_camera_data(record_dir, input_videos_dir)
+        #logging.info(f"解包完成: {camera_count} 个摄像头通道")
+        
 
         
         # 开始文件处理

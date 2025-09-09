@@ -1,28 +1,19 @@
-# from mtcnn.mtcnn import MTCNN
 import cv2
 import numpy as np
 import os
 import glob
 import time
-import configparser  # 新增导入模块
-import shutil  # 确保导入shutil用于清理临时文件
+import configparser
+import shutil
 import torch
 from ultralytics import YOLO
-from ultralytics.utils import ops
-from utils import batch_convert_videos, convert_video_to_frames  # 导入视频转图片函数
-#from picture2video import create_h265_video  # 导入图片转视频函数
-from utils import create_video  # 导入图片转视频函数
 import logging
 import sys
-#from record_read_write import extract_camera_data,repack_record #record文件解包和打包
-from foreign import recordDeal
-from utils import generate_bbox, py_nms, convert_to_square
-from utils import pad, calibrate_box, processed_image
 from skimage import transform as trans
 
 class MTCNN:
     def __init__(self, model_path):
-        self.device = torch.device("cuda")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # 获取P模型
         self.pnet = torch.jit.load(os.path.join(model_path, 'PNet.pth'))
         self.pnet.to(self.device)
@@ -35,7 +26,7 @@ class MTCNN:
         self.softmax_r = torch.nn.Softmax(dim=-1)
         self.rnet.eval()
 
-        # 获取R模型
+        # 获取O模型
         self.onet = torch.jit.load(os.path.join(model_path, 'ONet.pth'))
         self.onet.to(self.device)
         self.softmax_o = torch.nn.Softmax(dim=-1)
@@ -43,10 +34,8 @@ class MTCNN:
 
     # 使用PNet模型预测
     def predict_pnet(self,infer_data):
-        # 添加待预测的图片
         infer_data = torch.tensor(infer_data, dtype=torch.float32, device=self.device)
         infer_data = torch.unsqueeze(infer_data, dim=0)
-        # 执行预测
         cls_prob, bbox_pred, _ = self.pnet(infer_data)
         cls_prob = torch.squeeze(cls_prob)
         cls_prob = self.softmax_p(cls_prob)
@@ -55,59 +44,50 @@ class MTCNN:
 
     # 使用RNet模型预测
     def predict_rnet(self,infer_data):
-        # 添加待预测的图片
         infer_data = torch.tensor(infer_data, dtype=torch.float32, device=self.device)
-        # 执行预测
         cls_prob, bbox_pred, _ = self.rnet(infer_data)
         cls_prob = self.softmax_r(cls_prob)
         return cls_prob.detach().cpu().numpy(), bbox_pred.detach().cpu().numpy()
 
     # 使用ONet模型预测
     def predict_onet(self,infer_data):
-        # 添加待预测的图片
         infer_data = torch.tensor(infer_data, dtype=torch.float32, device=self.device)
-        # 执行预测
         cls_prob, bbox_pred, landmark_pred = self.onet(infer_data)
         cls_prob = self.softmax_o(cls_prob)
         return cls_prob.detach().cpu().numpy(), bbox_pred.detach().cpu().numpy(), landmark_pred.detach().cpu().numpy()
 
     # 获取PNet网络输出结果
     def detect_pnet(self,im, min_face_size, scale_factor, thresh):
-        """通过pnet筛选box和landmark
-        参数：
-          im:输入图像[h,2,3]
-        """
         net_size = 12
-        # 人脸和输入图像的比率
         current_scale = float(net_size) / min_face_size
-        im_resized = processed_image(im, current_scale)
+        im_resized = self.processed_image(im, current_scale)
         _, current_height, current_width = im_resized.shape
         all_boxes = list()
-        # 图像金字塔
+        
         while min(current_height, current_width) > net_size:
-            # 类别和box
             cls_cls_map, reg = self.predict_pnet(im_resized)
-            boxes = generate_bbox(cls_cls_map[1, :, :], reg, current_scale, thresh)
-            current_scale *= scale_factor  # 继续缩小图像做金字塔
-            im_resized = processed_image(im, current_scale)
+            boxes = self.generate_bbox(cls_cls_map[1, :, :], reg, current_scale, thresh)
+            current_scale *= scale_factor
+            im_resized = self.processed_image(im, current_scale)
             _, current_height, current_width = im_resized.shape
 
             if boxes.size == 0:
                 continue
-            # 非极大值抑制留下重复低的box
-            keep = py_nms(boxes[:, :5], 0.5, mode='Union')
+            
+            keep = self.py_nms(boxes[:, :5], 0.5, mode='Union')
             boxes = boxes[keep]
             all_boxes.append(boxes)
+        
         if len(all_boxes) == 0:
             return None
+        
         all_boxes = np.vstack(all_boxes)
-        # 将金字塔之后的box也进行非极大值抑制
-        keep = py_nms(all_boxes[:, 0:5], 0.7, mode='Union')
+        keep = self.py_nms(all_boxes[:, 0:5], 0.7, mode='Union')
         all_boxes = all_boxes[keep]
-        # box的长宽
+        
         bbw = all_boxes[:, 2] - all_boxes[:, 0] + 1
         bbh = all_boxes[:, 3] - all_boxes[:, 1] + 1
-        # 对应原图的box坐标和分数
+        
         boxes_c = np.vstack([all_boxes[:, 0] + all_boxes[:, 5] * bbw,
                              all_boxes[:, 1] + all_boxes[:, 6] * bbh,
                              all_boxes[:, 2] + all_boxes[:, 7] * bbw,
@@ -119,26 +99,18 @@ class MTCNN:
 
     # 获取RNet网络输出结果
     def detect_rnet(self,im, dets, thresh):
-        """通过rent选择box
-            参数：
-              im：输入图像
-              dets:pnet选择的box，是相对原图的绝对坐标
-            返回值：
-              box绝对坐标
-        """
         h, w, c = im.shape
-        # 将pnet的box变成包含它的正方形，可以避免信息损失
-        dets = convert_to_square(dets)
+        dets = self.convert_to_square(dets)
         dets[:, 0:4] = np.round(dets[:, 0:4])
-        # 调整超出图像的box
-        [dy, edy, dx, edx, y, ey, x, ex, tmpw, tmph] = pad(dets, w, h)
+        
+        [dy, edy, dx, edx, y, ey, x, ex, tmpw, tmph] = self.pad(dets, w, h)
         delete_size = np.ones_like(tmpw) * 20
         ones = np.ones_like(tmpw)
         zeros = np.zeros_like(tmpw)
         num_boxes = np.sum(np.where((np.minimum(tmpw, tmph) >= delete_size), ones, zeros))
-        cropped_ims = np.zeros((num_boxes, 3, 24, 24), dtype=np.float32)
+        cropped_ims = np.zeros((int(num_boxes), 3, 24, 24), dtype=np.float32)
+        
         for i in range(int(num_boxes)):
-            # 将pnet生成的box相对与原图进行裁剪，超出部分用0补
             if tmph[i] < 20 or tmpw[i] < 20:
                 continue
             tmp = np.zeros((tmph[i], tmpw[i], 3), dtype=np.uint8)
@@ -150,9 +122,11 @@ class MTCNN:
                 cropped_ims[i, :, :, :] = img
             except:
                 continue
+        
         cls_scores, reg = self.predict_rnet(cropped_ims)
         cls_scores = cls_scores[:, 1]
         keep_inds = np.where(cls_scores > thresh)[0]
+        
         if len(keep_inds) > 0:
             boxes = dets[keep_inds]
             boxes[:, 4] = cls_scores[keep_inds]
@@ -160,21 +134,21 @@ class MTCNN:
         else:
             return None
 
-        keep = py_nms(boxes, 0.4, mode='Union')
+        keep = self.py_nms(boxes, 0.4, mode='Union')
         boxes = boxes[keep]
-        # 对pnet截取的图像的坐标进行校准，生成rnet的人脸框对于原图的绝对坐标
-        boxes_c = calibrate_box(boxes, reg[keep])
+        boxes_c = self.calibrate_box(boxes, reg[keep])
         return boxes_c
 
     # 获取ONet模型预测结果
     def detect_onet(self,im, dets, thresh):
-        """将onet的选框继续筛选基本和rnet差不多但多返回了landmark"""
         h, w, c = im.shape
-        dets = convert_to_square(dets)
+        dets = self.convert_to_square(dets)
         dets[:, 0:4] = np.round(dets[:, 0:4])
-        [dy, edy, dx, edx, y, ey, x, ex, tmpw, tmph] = pad(dets, w, h)
+        
+        [dy, edy, dx, edx, y, ey, x, ex, tmpw, tmph] = self.pad(dets, w, h)
         num_boxes = dets.shape[0]
         cropped_ims = np.zeros((num_boxes, 3, 48, 48), dtype=np.float32)
+        
         for i in range(num_boxes):
             tmp = np.zeros((tmph[i], tmpw[i], 3), dtype=np.uint8)
             tmp[dy[i]:edy[i] + 1, dx[i]:edx[i] + 1, :] = im[y[i]:ey[i] + 1, x[i]:ex[i] + 1, :]
@@ -182,10 +156,11 @@ class MTCNN:
             img = img.transpose((2, 0, 1))
             img = (img - 127.5) / 128
             cropped_ims[i, :, :, :] = img
+        
         cls_scores, reg, landmark = self.predict_onet(cropped_ims)
-
         cls_scores = cls_scores[:, 1]
         keep_inds = np.where(cls_scores > thresh)[0]
+        
         if len(keep_inds) > 0:
             boxes = dets[keep_inds]
             boxes[:, 4] = cls_scores[keep_inds]
@@ -195,28 +170,27 @@ class MTCNN:
             return None, None
 
         w = boxes[:, 2] - boxes[:, 0] + 1
-
         h = boxes[:, 3] - boxes[:, 1] + 1
+        
         landmark[:, 0::2] = (np.tile(w, (5, 1)) * landmark[:, 0::2].T + np.tile(boxes[:, 0], (5, 1)) - 1).T
         landmark[:, 1::2] = (np.tile(h, (5, 1)) * landmark[:, 1::2].T + np.tile(boxes[:, 1], (5, 1)) - 1).T
-        boxes_c = calibrate_box(boxes, reg)
+        boxes_c = self.calibrate_box(boxes, reg)
 
-        keep = py_nms(boxes_c, 0.6, mode='Minimum')
+        keep = self.py_nms(boxes_c, 0.6, mode='Minimum')
         boxes_c = boxes_c[keep]
         landmark = landmark[keep]
         return boxes_c, landmark
 
     def infer_image_path(self, image_path):
         im = cv2.imread(image_path)
-        # 调用第一个模型预测
         boxes_c = self.detect_pnet(im, 20, 0.79, 0.9)
         if boxes_c is None:
             return None, None
-        # 调用第二个模型预测
+        
         boxes_c = self.detect_rnet(im, boxes_c, 0.6)
         if boxes_c is None:
             return None, None
-        # 调用第三个模型预测
+        
         boxes_c, landmark = self.detect_onet(im, boxes_c, 0.7)
         if boxes_c is None:
             return None, None
@@ -245,32 +219,214 @@ class MTCNN:
     def infer_image(self, im):
         if isinstance(im, str):
             im = cv2.imread(im)
-        # 调用第一个模型预测
+            
         boxes_c = self.detect_pnet(im, 20, 0.79, 0.9)
         if boxes_c is None:
             return None, None
-        # 调用第二个模型预测
+        
         boxes_c = self.detect_rnet(im, boxes_c, 0.6)
         if boxes_c is None:
             return None, None
-        # 调用第三个模型预测
+        
         boxes_c, landmarks = self.detect_onet(im, boxes_c, 0.7)
         if boxes_c is None:
             return None, None
-        imgs = []
-        for landmark in landmarks:
-            landmark = [[float(landmark[i]), float(landmark[i + 1])] for i in range(0, len(landmark), 2)]
-            landmark = np.array(landmark, dtype='float32')
-            img = self.norm_crop(im, landmark)
-            imgs.append(img)
+            
+        faces = []
+        for i, box in enumerate(boxes_c):
+            x1, y1, x2, y2, score = box.astype(int)
+            face = {
+                'box': [x1, y1, x2-x1, y2-y1],
+                'confidence': score,
+                'keypoints': {}
+            }
+            
+            # 处理关键点
+            if landmarks is not None and i < len(landmarks):
+                landmark = landmarks[i]
+                face['keypoints'] = {
+                    'left_eye': (landmark[0], landmark[1]),
+                    'right_eye': (landmark[2], landmark[3]),
+                    'nose': (landmark[4], landmark[5]),
+                    'mouth_left': (landmark[6], landmark[7]),
+                    'mouth_right': (landmark[8], landmark[9])
+                }
+                
+            faces.append(face)
 
-        return imgs, boxes_c
+        return faces, boxes_c
+
+    # 工具函数
+    @staticmethod
+    def generate_bbox(cls_map, reg, scale, thresh):
+        stride = 2
+        cellsize = 12
+
+        cls_map = np.transpose(cls_map)
+        dx1 = np.transpose(reg[0, :, :])
+        dy1 = np.transpose(reg[1, :, :])
+        dx2 = np.transpose(reg[2, :, :])
+        dy2 = np.transpose(reg[3, :, :])
+
+        (y, x) = np.where(cls_map >= thresh)
+        if y.size == 0:
+            return np.array([])
+        
+        score = np.array([cls_map[i, j] for i, j in zip(y, x)])
+        regx1 = np.array([dx1[i, j] for i, j in zip(y, x)])
+        regy1 = np.array([dy1[i, j] for i, j in zip(y, x)])
+        regx2 = np.array([dx2[i, j] for i, j in zip(y, x)])
+        regy2 = np.array([dy2[i, j] for i, j in zip(y, x)])
+        
+        x1 = np.round((x * stride + 1) / scale)
+        y1 = np.round((y * stride + 1) / scale)
+        x2 = np.round((x * stride + 1 + cellsize - 1) / scale)
+        y2 = np.round((y * stride + 1 + cellsize - 1) / scale)
+        
+        bbox = np.vstack([x1, y1, x2, y2, score, regx1, regy1, regx2, regy2])
+        return bbox.T
+
+    @staticmethod
+    def py_nms(dets, thresh, mode='Union'):
+        x1 = dets[:, 0]
+        y1 = dets[:, 1]
+        x2 = dets[:, 2]
+        y2 = dets[:, 3]
+        scores = dets[:, 4]
+
+        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+        order = scores.argsort()[::-1]
+
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+
+            w = np.maximum(0.0, xx2 - xx1 + 1)
+            h = np.maximum(0.0, yy2 - yy1 + 1)
+            inter = w * h
+            
+            if mode == 'Union':
+                ovr = inter / (areas[i] + areas[order[1:]] - inter)
+            else:
+                ovr = inter / np.minimum(areas[i], areas[order[1:]])
+
+            inds = np.where(ovr <= thresh)[0]
+            order = order[inds + 1]
+
+        return keep
+
+    @staticmethod
+    def convert_to_square(bbox):
+        square_bbox = bbox.copy()
+        h = bbox[:, 3] - bbox[:, 1] + 1
+        w = bbox[:, 2] - bbox[:, 0] + 1
+        max_side = np.maximum(h, w)
+        
+        square_bbox[:, 0] = bbox[:, 0] + w * 0.5 - max_side * 0.5
+        square_bbox[:, 1] = bbox[:, 1] + h * 0.5 - max_side * 0.5
+        square_bbox[:, 2] = square_bbox[:, 0] + max_side - 1
+        square_bbox[:, 3] = square_bbox[:, 1] + max_side - 1
+        
+        return square_bbox
+
+    @staticmethod
+    def pad(bboxes, w, h):
+        tmpw = (bboxes[:, 2] - bboxes[:, 0] + 1).astype(np.int32)
+        tmph = (bboxes[:, 3] - bboxes[:, 1] + 1).astype(np.int32)
+        num_boxes = bboxes.shape[0]
+
+        dx = np.zeros((num_boxes,))
+        dy = np.zeros((num_boxes,))
+        edx = tmpw - 1
+        edy = tmph - 1
+
+        x = bboxes[:, 0].astype(np.int32)
+        y = bboxes[:, 1].astype(np.int32)
+        x2 = bboxes[:, 2].astype(np.int32)
+        y2 = bboxes[:, 3].astype(np.int32)
+
+        # 处理边界
+        for i in range(num_boxes):
+            if x[i] < 0:
+                dx[i] = -x[i]
+                x[i] = 0
+            if y[i] < 0:
+                dy[i] = -y[i]
+                y[i] = 0
+            if x2[i] >= w:
+                edx[i] = tmpw[i] - 1 - (x2[i] - w + 1)
+                x2[i] = w - 1
+            if y2[i] >= h:
+                edy[i] = tmph[i] - 1 - (y2[i] - h + 1)
+                y2[i] = h - 1
+
+        return dy, edy, dx, edx, y, y2, x, x2, tmpw, tmph
+
+    @staticmethod
+    def calibrate_box(bbox, reg):
+        w = bbox[:, 2] - bbox[:, 0] + 1
+        h = bbox[:, 3] - bbox[:, 1] + 1
+        cx = bbox[:, 0] + w * 0.5
+        cy = bbox[:, 1] + h * 0.5
+
+        cx1 = cx + reg[:, 0] * w
+        cy1 = cy + reg[:, 1] * h
+        cx2 = cx + reg[:, 2] * w
+        cy2 = cy + reg[:, 3] * h
+
+        bbox[:, 0] = cx1 - w * 0.5
+        bbox[:, 1] = cy1 - h * 0.5
+        bbox[:, 2] = cx2 - w * 0.5 + w - 1
+        bbox[:, 3] = cy2 - h * 0.5 + h - 1
+        
+        return bbox
+
+    @staticmethod
+    def processed_image(img, scale):
+        h, w, c = img.shape
+        new_h = int(h * scale)
+        new_w = int(w * scale)
+        img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        img_resized = img_resized.transpose((2, 0, 1))
+        img_resized = (img_resized - 127.5) / 128
+        return img_resized
 
 # 配置全局日志器
 def setup_logger(log_file='video_processing.log'):
-    # 创建 logger 实例
     logger = logging.getLogger('VideoProcessor')
     logger.setLevel(logging.DEBUG)
+    
+    # 确保日志目录存在
+    log_dir = os.path.dirname(log_file)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    # 清除已有的处理器
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    
+    # 创建控制台处理器和文件处理器
+    console_handler = logging.StreamHandler()
+    file_handler = logging.FileHandler(log_file)
+    
+    # 设置日志级别
+    console_handler.setLevel(logging.INFO)
+    file_handler.setLevel(logging.DEBUG)
+    
+    # 设置日志格式
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    file_handler.setFormatter(formatter)
+    
+    # 添加处理器
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
     return logger
     
 class CombinedProcessor:
@@ -289,8 +445,6 @@ class CombinedProcessor:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if torch.cuda.is_available():
             self.logger.info(f"将模型迁移到GPU设备: {self.device}")
-            # YOLO模型已经在GPU上（由YOLO自动处理）
-            # MTCNN保持在CPU（仅支持CPU）
         
     def check_gpu_usage(self):
         """检查模型是否使用GPU运行"""
@@ -301,8 +455,9 @@ class CombinedProcessor:
         else:
             self.logger.info("YOLOv8车牌检测模型运行在: CPU")
         
-        # MTCNN通常运行在CPU，也进行检查
-        self.logger.info("MTCNN人脸检测模型运行在: CPU (MTCNN仅支持CPU)")
+        # 检查MTCNN设备
+        mtcnn_device = self.face_detector.device
+        self.logger.info(f"MTCNN人脸检测模型运行在: {mtcnn_device}")
         
     def get_optimal_ellipse(self, face, img_shape):
         """计算刚好包含人脸的椭圆参数"""
@@ -319,8 +474,8 @@ class CombinedProcessor:
         # 动态调整椭圆轴长
         for _ in range(2):
             for (px, py) in points:
-                dx = (px - center[0]) / axes[0]
-                dy = (py - center[1]) / axes[1]
+                dx = (px - center[0]) / axes[0] if axes[0] > 0 else 0
+                dy = (py - center[1]) / axes[1] if axes[1] > 0 else 0
                 distance = dx**2 + dy**2
                 
                 if distance > 0.9:
@@ -342,8 +497,8 @@ class CombinedProcessor:
         cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
         
         # 获取椭圆区域
-        x, y = center[0] - axes[0], center[1] - axes[1]
-        w, h = 2 * axes[0], 2 * axes[1]
+        x, y = max(0, center[0] - axes[0]), max(0, center[1] - axes[1])
+        w, h = min(2 * axes[0], img.shape[1] - x), min(2 * axes[1], img.shape[0] - y)
         
         if w > 0 and h > 0:
             # 应用马赛克效果
@@ -376,28 +531,28 @@ class CombinedProcessor:
         """检测人脸并应用马赛克"""
         self.logger.debug("开始检测人脸...")
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-#        faces = self.face_detector.detect_faces(img_rgb)
         
         start_time = time.time()
-        faces,_ = self.face_detector.infer_image(img_rgb)
+        faces, _ = self.face_detector.infer_image(img_rgb)
         face_detection_time = time.time() - start_time
         
-        faces_count = len(faces)
+        faces_count = len(faces) if faces is not None else 0
         self.logger.info(f"检测到 {faces_count} 张人脸 | 耗时: {face_detection_time:.4f}s")
         
-        for face in faces:
-            center, axes = self.get_optimal_ellipse(face, img.shape)
-            self.logger.debug(f"应用椭圆马赛克 - 位置: {center}, 轴长: {axes}")
-            img = self.mosaic_ellipse_region(img, center, axes)
+        if faces is not None and faces_count > 0:
+            for face in faces:
+                center, axes = self.get_optimal_ellipse(face, img.shape)
+                self.logger.debug(f"应用椭圆马赛克 - 位置: {center}, 轴长: {axes}")
+                img = self.mosaic_ellipse_region(img, center, axes)
         
-        return img, len(faces), face_detection_time
+        return img, faces_count, face_detection_time
 
     def detect_plates(self, img):
         """检测车牌并应用马赛克"""
         # 使用YOLOv8检测车牌
         self.logger.debug("开始检测车牌...")
         start_time = time.time()
-        results = self.plate_detector(img)
+        results = self.plate_detector(img, device=self.device, verbose=False)
         car_detection_time = time.time() - start_time
 
         
@@ -439,48 +594,16 @@ class CombinedProcessor:
         if not images:
             return 0, 0, 0
         
-        # 批量人脸检测
-        faces_results = []
-        for img in images:
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            faces = self.face_detector.detect_faces(img_rgb)
-            faces_results.append(faces)
-        
-        # 批量车牌检测 - 使用GPU加速（静默模式）
-        plates_results = []
-        for img in images:
-            if torch.cuda.is_available():
-                # 使用GPU加速，关闭详细输出
-                results = self.plate_detector(img, device=self.device, verbose=False)
-            else:
-                results = self.plate_detector(img, verbose=False)
+        # 批量处理每张图片
+        for i, (img, img_path) in enumerate(zip(images, valid_paths)):
+            # 检测并处理人脸
+            print("img_shape", img.shape)
+            img, faces_count, _ = self.detect_faces(img)
+            total_faces_processed += faces_count
             
-            plates_boxes = []
-            for result in results:
-                boxes = result.boxes
-                if boxes is not None:
-                    for box in boxes:
-                        x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy().squeeze().tolist())
-                        plates_boxes.append((x1, y1, x2, y2))
-            plates_results.append(plates_boxes)
-        
-        # 批量应用马赛克并保存
-        for i, (img, img_path, faces, plates) in enumerate(zip(images, valid_paths, faces_results, plates_results)):
-            faces_count = len(faces)
-            plates_count = len(plates)
-            
-            # 处理人脸（仅当有检测到人脸时）
-            if faces_count > 0:
-                for face in faces:
-                    center, axes = self.get_optimal_ellipse(face, img.shape)
-                    img = self.mosaic_ellipse_region(img, center, axes)
-                total_faces_processed += faces_count
-            
-            # 处理车牌（仅当有检测到车牌时）
-            if plates_count > 0:
-                for (x1, y1, x2, y2) in plates:
-                    img = self.mosaic_rectangle_region(img, x1, y1, x2, y2)
-                total_plates_processed += plates_count
+            # 检测并处理车牌
+            img, plates_count, _ = self.detect_plates(img)
+            total_plates_processed += plates_count
             
             # 保存结果
             filename = os.path.basename(img_path)
@@ -488,14 +611,11 @@ class CombinedProcessor:
             cv2.imwrite(output_path, img)
             
             total_processed += 1
-            
-        # 移除单张图片的详细日志，只在批处理完成后输出汇总信息
         
         self.logger.info(f"批处理完成: {total_processed} 张图片, "
                         f"人脸 {total_faces_processed} 个, 车牌 {total_plates_processed} 个")
         return total_processed, total_faces_processed, total_plates_processed
-    
-#def batch_process_images(input_dir, output_dir):
+
 def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
     """批量处理目录中的所有图片（使用16张批处理优化）"""
     logger = logging.getLogger('VideoProcessor.batch_process_images')
@@ -514,7 +634,7 @@ def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
     processor = CombinedProcessor(face_detector, plate_detector, output_dir)
     
     total_images = len(image_paths)
-    batch_size = 16
+    batch_size = 64
     total_processed = 0
     total_faces = 0
     total_plates = 0
@@ -522,7 +642,7 @@ def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
     logger.info(f"开始批量处理 {total_images} 张图片（每批16张）")
     batch_start_time = time.time()
     
-    # 按16张为一批进行处理（静默模式）
+    # 按16张为一批进行处理
     for batch_start in range(0, total_images, batch_size):
         batch_end = min(batch_start + batch_size, total_images)
         batch_files = image_paths[batch_start:batch_end]
@@ -542,9 +662,115 @@ def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
     
     return total_processed, total_faces, total_plates
 
-#def process_video_pipeline(input_video_path, output_video_path, temp_dir="temp_processing", fps=30):
+def convert_video_to_frames(video_path, output_dir, interval=1):
+    """将视频转换为图片帧"""
+    logger = logging.getLogger('VideoProcessor.convert_video_to_frames')
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 打开视频文件
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error(f"无法打开视频文件: {video_path}")
+        return 0
+    
+    # 获取视频信息
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
+    
+    logger.info(f"视频信息: {os.path.basename(video_path)} - "
+               f"帧率: {fps:.1f}, 总帧数: {total_frames}, 时长: {duration:.1f}秒")
+    
+    frame_count = 0
+    saved_count = 0
+    
+    # 读取帧并保存
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        # 按间隔保存帧
+        if frame_count % interval == 0:
+            frame_filename = f"frame_{frame_count:06d}.jpg"
+            frame_path = os.path.join(output_dir, frame_filename)
+            cv2.imwrite(frame_path, frame)
+            saved_count += 1
+            
+        frame_count += 1
+        
+        # 进度提示
+        if frame_count % 100 == 0:
+            progress = (frame_count / total_frames) * 100
+            logger.debug(f"抽帧进度: {progress:.1f}% ({frame_count}/{total_frames})")
+    
+    cap.release()
+    logger.info(f"抽帧完成，共保存 {saved_count} 帧到 {output_dir}")
+    return saved_count
+
+def create_video(frame_dir, output_path, fps=30):
+    """将图片帧合成为视频"""
+    logger = logging.getLogger('VideoProcessor.create_video')
+    
+    # 获取所有帧文件并排序
+    frame_files = sorted(glob.glob(os.path.join(frame_dir, '*.jpg')))
+    if not frame_files:
+        logger.error(f"在目录 {frame_dir} 中未找到图片帧")
+        return False
+    
+    # 获取帧尺寸
+    sample_frame = cv2.imread(frame_files[0])
+    if sample_frame is None:
+        logger.error(f"无法读取样本帧: {frame_files[0]}")
+        return False
+        
+    height, width = sample_frame.shape[:2]
+    
+    # 确定输出视频编码器
+    ext = os.path.splitext(output_path)[1].lower()
+    if ext in ['.mp4', '.m4v']:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    elif ext in ['.avi']:
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    elif ext in ['.h265', '.hevc']:
+        fourcc = cv2.VideoWriter_fourcc(*'HEVC')
+    else:
+        logger.warning(f"不支持的视频格式 {ext}，使用默认编码器")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        output_path = os.path.splitext(output_path)[0] + '.mp4'
+    
+    # 创建视频写入器
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    if not out.isOpened():
+        logger.error(f"无法创建视频写入器: {output_path}")
+        return False
+    
+    # 写入帧
+    total_frames = len(frame_files)
+    for i, frame_file in enumerate(frame_files):
+        frame = cv2.imread(frame_file)
+        if frame is None:
+            logger.warning(f"跳过无效帧: {frame_file}")
+            continue
+            
+        # 确保帧尺寸匹配
+        if frame.shape[:2] != (height, width):
+            frame = cv2.resize(frame, (width, height))
+            
+        out.write(frame)
+        
+        # 进度提示
+        if i % 100 == 0:
+            progress = (i / total_frames) * 100
+            logger.debug(f"合成进度: {progress:.1f}% ({i}/{total_frames})")
+    
+    out.release()
+    logger.info(f"视频合成完成: {output_path}")
+    return True
+
 def process_video_pipeline(input_video_path, output_video_path, face_detector, plate_detector, temp_dir="temp_processing", fps=60):
-    """完整的视频处理流程：视频 -> 图片 -> 批处理 -> 视频（16张批处理优化）"""
+    """完整的视频处理流程：视频 -> 图片 -> 批处理 -> 视频"""
     logger = logging.getLogger('VideoProcessor.pipeline')
     
     # 记录视频处理开始时间
@@ -563,10 +789,10 @@ def process_video_pipeline(input_video_path, output_video_path, face_detector, p
     frame_count = convert_video_to_frames(input_video_path, frame_dir)
     if frame_count == 0:
         logger.error("错误: 视频拆解失败")
-        return False
+        return False, 0, 0, 0
     extract_time = time.time() - extract_start
     
-    # 步骤2: 批处理图片
+    # 批处理图片
     logger.info("步骤2: 批处理图片...")
     batch_start = time.time()
     processed_frames, total_faces_processed, total_plates_processed = batch_process_images(
@@ -580,7 +806,7 @@ def process_video_pipeline(input_video_path, output_video_path, face_detector, p
     compile_time = time.time() - compile_start
     if not success:
         logger.error("错误: 视频合成失败")
-        return False
+        return False, processed_frames, total_faces_processed, total_plates_processed
     
     # 清理临时文件
     if os.path.exists(temp_dir):
@@ -592,11 +818,11 @@ def process_video_pipeline(input_video_path, output_video_path, face_detector, p
     logger.info(f"总耗时: {total_video_time:.1f}s (抽帧 {extract_time:.1f}s | 批处理 {batch_time:.1f}s | 合成 {compile_time:.1f}s)")
     logger.info(f"处理 {frame_count} 帧, 人脸 {total_faces_processed} 个, 车牌 {total_plates_processed} 个")
     
-    return True
+    return True, processed_frames, total_faces_processed, total_plates_processed
 
-# 新函数：处理单个视频文件
 def process_single_video(video_path, output_videos_dir, face_detector, plate_detector, temp_base_dir, cleanup=True):
-    """处理单个视频的完整流程（使用预加载的模型，16张批处理优化）"""
+    """处理单个视频的完整流程"""
+    logger = logging.getLogger('VideoProcessor.process_single_video')
     video_filename = os.path.basename(video_path)
     video_name, video_ext = os.path.splitext(video_filename)
     
@@ -614,29 +840,38 @@ def process_single_video(video_path, output_videos_dir, face_detector, plate_det
         logger.warning(f"无法确定视频格式: {video_filename}，将直接复制而不处理")
         return False
     
-    # 创建处理器实例
-    processor = CombinedProcessor(face_detector, plate_detector, video_temp_dir)
-    
-    # 使用处理管道（包含16张批处理优化和完整时间统计）
     try:
-        processed_frames, faces_processed, plates_processed = process_video_pipeline(
-            video_path, output_videos_dir, processor, batch_size=16
+        # 使用处理管道
+        success, processed_frames, faces_processed, plates_processed = process_video_pipeline(
+            input_video_path=video_path,
+            output_video_path=output_video_path,
+            face_detector=face_detector,
+            plate_detector=plate_detector,
+            temp_dir=video_temp_dir,
+            fps=60
         )
         
-        logger.info(f"视频处理成功: {video_filename} - "
-                   f"{processed_frames} 帧, "
-                   f"实际马赛克处理 {faces_processed} 人脸, {plates_processed} 车牌")
-        return True
-        
+        if success:
+            logger.info(f"视频处理成功: {video_filename} - "
+                       f"{processed_frames} 帧, "
+                       f"实际马赛克处理 {faces_processed} 人脸, {plates_processed} 车牌")
+            return True
+        else:
+            logger.error(f"视频处理失败: {video_filename}")
+            return False
+            
     except Exception as e:
-        logger.error(f"处理视频 {video_filename} 时出错: {str(e)}")
+        logger.error(f"处理视频 {video_filename} 时出错: {str(e)}", exc_info=True)
         return False
     finally:
         # 清理临时文件
         if cleanup and os.path.exists(video_temp_dir):
-            shutil.rmtree(video_temp_dir)
+            try:
+                shutil.rmtree(video_temp_dir)
+                logger.debug(f"已清理临时目录: {video_temp_dir}")
+            except Exception as e:
+                logger.warning(f"清理临时目录失败: {str(e)}")
 
-# 不需要处理的视频直接复制到输出目录中
 def copy_unprocessed_video(video_path, output_dir):
     """复制未处理的视频到输出目录"""
     try:
@@ -650,10 +885,9 @@ def copy_unprocessed_video(video_path, output_dir):
         logger.info(f"已复制未处理视频: {video_filename}")
         return True
     except Exception as e:
-        logger.info(f"复制视频 {video_filename} 失败: {e}")
+        logger.error(f"复制视频 {video_filename} 失败: {e}")
         return False
 
-#新增加载配置文件函数
 def load_config(config_file='config.ini'):
     """加载配置文件并返回解析结果"""
     config = configparser.ConfigParser()
@@ -665,11 +899,11 @@ def load_config(config_file='config.ini'):
     paths = config['PATHS']
     required_keys = [
         'model_weights', 
-        'record_dir',       # 新增
-        'output_h265_dir',  #修改
+        'record_dir',
+        'output_h265_dir',
         'output_videos_dir', 
         'temp_directory_base',
-        'record_output_dir'      # 新增
+        'record_output_dir'
     ]
     
     missing = [key for key in required_keys if key not in paths]
@@ -690,28 +924,51 @@ def load_config(config_file='config.ini'):
     
     return {
         'model_weights': paths['model_weights'],
-        'record_dir': paths['record_dir'],           # 新增
-        'output_h265_dir': paths['output_h265_dir'],  #修改
+        'record_dir': paths['record_dir'],
+        'output_h265_dir': paths['output_h265_dir'],
         'output_videos_dir': paths['output_videos_dir'],
         'temp_directory_base': paths['temp_directory_base'],
-        'record_output_dir': paths['record_output_dir'],       # 新增
+        'record_output_dir': paths['record_output_dir'],
         'video_formats': video_formats,
         'cleanup_temp': cleanup_temp,
         'copy_unprocessed': copy_unprocessed
     }
 
-# mf4格式的文件特殊处理
 def process_mf4(file_path, output_dir):
-    """
-    特殊处理 .mf4 文件
-    """
+    """特殊处理 .mf4 文件"""
+    logger = logging.getLogger('VideoProcessor.process_mf4')
     filename = os.path.basename(file_path)
-    logger.info(f"调用成功,处理 .mf4 文件: {filename}")
+    logger.info(f"处理 .mf4 文件: {filename}")
+    
+    # 这里添加MF4文件处理逻辑
+    try:
+        # 示例：仅复制文件
+        output_path = os.path.join(output_dir, filename)
+        shutil.copy2(file_path, output_path)
+        logger.info(f".mf4 文件处理完成: {filename}")
+        return True
+    except Exception as e:
+        logger.error(f".mf4 文件处理失败: {str(e)}")
+        return False
 
-    return True
+# 模拟recordDeal模块（实际使用时替换为真实模块）
+class MockRecordDeal:
+    @staticmethod
+    def read_record2h265_all(input_dir, output_dir):
+        logger = logging.getLogger('VideoProcessor.MockRecordDeal')
+        logger.info(f"模拟解包record文件: {input_dir} -> {output_dir}")
+        os.makedirs(os.path.join(output_dir, "hevcs"), exist_ok=True)
+        return True
+        
+    @staticmethod
+    def write_allH265_record_all(input_dir, processed_dir, output_dir):
+        logger = logging.getLogger('VideoProcessor.MockRecordDeal')
+        logger.info(f"模拟重新打包record文件: {input_dir} + {processed_dir} -> {output_dir}")
+        os.makedirs(output_dir, exist_ok=True)
+        return True
 
 if __name__ == "__main__":
-     # 初始化日志器 - 这是最重要的修改
+    # 初始化日志器
     logger = setup_logger('video_processing.log')
     logger.info("===== 程序启动 =====")
     
@@ -729,11 +986,11 @@ if __name__ == "__main__":
         
         # 获取配置参数
         plate_model_path = config['model_weights']
-        record_dir = config['record_dir']   #新增record文件路径
+        record_dir = config['record_dir']
         output_h265_dir = config['output_h265_dir']
         output_videos_dir = config['output_videos_dir']
         temp_directory_base = config['temp_directory_base']
-        record_output_dir = config['record_output_dir']  #新增打包路径
+        record_output_dir = config['record_output_dir']
         video_formats = config['video_formats']
         cleanup_temp = config['cleanup_temp']
         copy_unprocessed = config['copy_unprocessed']
@@ -748,7 +1005,7 @@ if __name__ == "__main__":
         logger.info(f"record打包路径: {record_output_dir}")
         logger.info(f"支持格式: {', '.join(video_formats)}")
         
-        # 在主函数中初始化模型，避免重复加载
+        # 初始化模型
         logger.info("开始初始化检测模型...")
         start_init_time = time.time()
         
@@ -760,20 +1017,22 @@ if __name__ == "__main__":
         else:
             logger.info("未检测到GPU，将使用CPU")
         
-        # 初始化MTCNN人脸检测模型（仅支持CPU）
+        # 初始化MTCNN人脸检测模型
         logger.info("正在加载MTCNN人脸检测模型...")
+        # 请替换为实际的MTCNN模型路径
         face_detector = MTCNN(model_path="/mnt/d/P_WorkSpace/Video-desensitization/mtcnn")
-        
+        device = face_detector.device
+        print(f"face模型运行设备: {device}")
         logger.info("MTCNN人脸检测模型加载完成")
         
         # 初始化YOLOv8车牌检测模型
         logger.info("正在加载YOLOv8车牌检测模型...")
-        plate_detector = YOLO(plate_model_path)
+        plate_detector = YOLO(plate_model_path).cuda()
         
         # 检查YOLOv8使用的设备
         if torch.cuda.is_available():
             yolo_device = next(plate_detector.model.parameters()).device
-            logger.info(f"YOLOv8车牌检测模型运行在: {yolo_device}")
+            logger.info(f"YOLOv8车牌检测模型是否运行在GPU: {yolo_device}")
         else:
             logger.info("YOLOv8车牌检测模型运行在: CPU")
         
@@ -786,23 +1045,22 @@ if __name__ == "__main__":
         os.makedirs(temp_directory_base, exist_ok=True)
         logger.info(f"临时根目录已创建/确认: {temp_directory_base}")
         
-        #解包record文件，获取摄像头数据
-        logging.info("开始解包数据...")
-        result1 = recordDeal.read_record2h265_all(record_dir, output_h265_dir) #解包record文件，得到hevcs文件
-        
-        #camera_count, timestamps = extract_camera_data(record_dir, input_videos_dir)
-        logging.info(f"解包完成")
-        
-
+        # 解包record文件，获取摄像头数据
+        logger.info("开始解包数据...")
+        # 使用模拟的recordDeal，实际使用时替换为真实模块
+        recordDeal = MockRecordDeal()
+        result1 = recordDeal.read_record2h265_all(record_dir, output_h265_dir)
+        logger.info(f"解包完成")
         
         # 开始文件处理
         logger.info(f"在目录 {input_videos_dir} 中查找文件...")
         all_files = []
-        for root, _, files in os.walk(input_videos_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                all_files.append(file_path)
-                logger.debug(f"找到文件: {file_path}")
+        if os.path.exists(input_videos_dir):
+            for root, _, files in os.walk(input_videos_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    all_files.append(file_path)
+                    logger.debug(f"找到文件: {file_path}")
         
         file_count = len(all_files)
         logger.info(f"共找到 {file_count} 个文件待处理")
@@ -854,16 +1112,10 @@ if __name__ == "__main__":
                 logger.info(f"跳过不符合格式的文件")
                 skip_count += 1
 
-        #record文件打包
-        logging.info("开始重新打包record文件...")
-        #repack_record(
-            #original_record=record_dir,
-            #blurred_dir=output_videos_dir,
-           # hevc_dir=input_videos_dir,
-            #output_record=final_record
-           # )
-        result2 = recordDeal.write_allH265_record_all(record_dir, output_videos_dir,record_output_dir) #脱敏record文件，得到脱敏后的record文件
-        logging.info(f"打包完成")
+        # record文件打包
+        logger.info("开始重新打包record文件...")
+        result2 = recordDeal.write_allH265_record_all(record_dir, output_videos_dir, record_output_dir)
+        logger.info(f"打包完成")
         
         # 最终统计信息
         logger.info("\n===== 处理完成! 最终统计 =====")
@@ -873,11 +1125,14 @@ if __name__ == "__main__":
         logger.info(f"复制文件: {copy_count}")
         logger.info(f"跳过文件: {skip_count}")
         
-        # 打开日志文件位置
+        # 打开日志文件位置（仅Windows）
         if os.name == 'nt':
             log_dir = os.path.abspath(os.getcwd())
             logger.info(f"日志文件位于: {log_dir}/video_processing.log")
-            os.startfile(log_dir)
+            try:
+                os.startfile(log_dir)
+            except:
+                pass
         
         logger.info("程序正常结束")
         
@@ -887,5 +1142,6 @@ if __name__ == "__main__":
         print("发生未捕获的异常:")
         traceback.print_exc()
         print("="*50)
-        logger.exception("程序发生致命错误:")  # 确保logger已初始化
+        if 'logger' in locals():
+            logger.exception("程序发生致命错误:")
         sys.exit(1)

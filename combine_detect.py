@@ -10,6 +10,7 @@ from ultralytics import YOLO
 import logging
 import sys
 from skimage import transform as trans
+from dataloader import VideoFrameDataset
 
 class MTCNN:
     def __init__(self, model_path):
@@ -220,15 +221,15 @@ class MTCNN:
         if isinstance(im, str):
             im = cv2.imread(im)
             
-        boxes_c = self.detect_pnet(im, 20, 0.79, 0.9)
+        boxes_c = self.detect_pnet(im, 20, 0.79, 0.95)  # 提高PNet阈值
         if boxes_c is None:
             return None, None
         
-        boxes_c = self.detect_rnet(im, boxes_c, 0.6)
+        boxes_c = self.detect_rnet(im, boxes_c, 0.8)  # 提高RNet阈值
         if boxes_c is None:
             return None, None
         
-        boxes_c, landmarks = self.detect_onet(im, boxes_c, 0.7)
+        boxes_c, landmarks = self.detect_onet(im, boxes_c, 0.9)  # 提高ONet阈值
         if boxes_c is None:
             return None, None
             
@@ -428,12 +429,51 @@ def setup_logger(log_file='video_processing.log'):
     logger.addHandler(file_handler)
     
     return logger
+
+def check_available_codecs():
+    """检查系统可用的视频编码器"""
+    logger = logging.getLogger('VideoProcessor')
+    
+    # 测试常用编码器
+    test_codecs = [
+        ('mp4v', 'MP4V'),
+        ('avc1', 'H.264'),
+        ('XVID', 'XVID'),
+        ('MJPG', 'MJPEG'),
+        ('X264', 'H.264'),
+        ('HEVC', 'HEVC/H.265')
+    ]
+    
+    available_codecs = []
+    width, height, fps = 640, 480, 30
+    
+    for codec_code, codec_name in test_codecs:
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*codec_code)
+            test_path = f'test_codec_{codec_code}.mp4'
+            test_writer = cv2.VideoWriter(test_path, fourcc, fps, (width, height))
+            
+            if test_writer.isOpened():
+                available_codecs.append((codec_code, codec_name))
+                test_writer.release()
+            
+            try:
+                if os.path.exists(test_path):
+                    os.remove(test_path)
+            except:
+                pass
+                
+        except Exception as e:
+            logger.debug(f"编码器 {codec_code} 测试失败: {e}")
+    
+    return available_codecs
     
 class CombinedProcessor:
-    def __init__(self, face_detector, plate_detector, output_dir):
+    def __init__(self, face_detector, plate_detector, output_dir, debug_mode=False):
         self.face_detector = face_detector
         self.plate_detector = plate_detector
         self.output_dir = output_dir
+        self.debug_mode = debug_mode
         self.logger = logging.getLogger('VideoProcessor.CombinedProcessor')
         os.makedirs(output_dir, exist_ok=True)
         self.logger.info(f"输出目录已创建: {output_dir}")
@@ -529,136 +569,191 @@ class CombinedProcessor:
 
     def detect_faces(self, img):
         """检测人脸并应用马赛克"""
-        self.logger.debug("开始检测人脸...")
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
         start_time = time.time()
-        faces, _ = self.face_detector.infer_image(img_rgb)
+        faces, _ = self.face_detector.infer_image(img)
         face_detection_time = time.time() - start_time
         
         faces_count = len(faces) if faces is not None else 0
-        self.logger.info(f"检测到 {faces_count} 张人脸 | 耗时: {face_detection_time:.4f}s")
         
         if faces is not None and faces_count > 0:
             for face in faces:
                 center, axes = self.get_optimal_ellipse(face, img.shape)
-                self.logger.debug(f"应用椭圆马赛克 - 位置: {center}, 轴长: {axes}")
                 img = self.mosaic_ellipse_region(img, center, axes)
         
         return img, faces_count, face_detection_time
 
     def detect_plates(self, img):
         """检测车牌并应用马赛克"""
-        # 使用YOLOv8检测车牌
-        self.logger.debug("开始检测车牌...")
         start_time = time.time()
-        results = self.plate_detector(img, device=self.device, verbose=False)
+        results = self.plate_detector(img, device=self.device, verbose=False, conf=0.5)  # 设置置信度阈值为0.5
         car_detection_time = time.time() - start_time
 
-        
         plates_count = 0
         for result in results:
             boxes = result.boxes
             for box in boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy().squeeze().tolist())
-                img = self.mosaic_rectangle_region(img, x1, y1, x2, y2)
-                plates_count += 1
-                self.logger.debug(f"检测到车牌 #{plates_count} - 坐标: ({x1},{y1})-({x2},{y2})")
+                confidence = float(box.conf.cpu().numpy().squeeze())
+                if confidence >= 0.5:  # 只处理置信度>=0.5的检测结果
+                    x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy().squeeze().tolist())
+                    img = self.mosaic_rectangle_region(img, x1, y1, x2, y2)
+                    plates_count += 1
 
-        self.logger.info(f"检测到 {plates_count} 个车牌 | 耗时: {car_detection_time:.4f}s")
         return img, plates_count, car_detection_time
 
+    def process_images_batch_dataloader(self, batch_images, batch_paths):
+        """使用DataLoader批量处理图片"""
+        if len(batch_images) == 0:
+            return 0, 0, 0
+            
+        batch_start_time = time.time()
+        
+        total_processed = 0
+        total_faces_processed = 0
+        total_plates_processed = 0
+        
+        # 处理批次中的每张图片
+        for i, (image, img_path) in enumerate(zip(batch_images, batch_paths)):
+            try:
+                # 确保图像是numpy数组
+                if isinstance(image, torch.Tensor):
+                    image = image.numpy()
+                
+                # 确保数据类型正确
+                if image.dtype != np.uint8:
+                    image = image.astype(np.uint8)
+                
+                # 检测并处理人脸
+                processed_img, faces_count, _ = self.detect_faces(image)
+                total_faces_processed += faces_count
+                
+                # 检测并处理车牌
+                processed_img, plates_count, _ = self.detect_plates(processed_img)
+                total_plates_processed += plates_count
+                
+                # 保存处理后的图片
+                filename = os.path.basename(str(img_path))
+                output_path = os.path.join(self.output_dir, filename)
+                
+                # 转换回BGR格式保存
+                processed_img_bgr = cv2.cvtColor(processed_img, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(output_path, processed_img_bgr)
+                
+                total_processed += 1
+                
+            except Exception as e:
+                self.logger.error(f"处理图片 {img_path} 时出错: {str(e)}")
+                continue
+        
+        batch_time = time.time() - batch_start_time
+        
+        # 批次级别的统计信息
+        if total_faces_processed > 0 or total_plates_processed > 0:
+            self.logger.info(f"批次处理完成: {total_processed} 张图片, "
+                           f"检测到 {total_faces_processed} 个人脸, {total_plates_processed} 个车牌 "
+                           f"| 耗时: {batch_time:.2f}s")
+        else:
+            self.logger.debug(f"批次处理完成: {total_processed} 张图片, 无检测目标 | 耗时: {batch_time:.2f}s")
+            
+        return total_processed, total_faces_processed, total_plates_processed
+
     def process_images_batch(self, image_paths):
-        """批量处理多张图片（16张批处理优化）"""
+        """批量处理多张图片（16张批处理优化）- 已废弃，使用DataLoader版本"""
         if not image_paths:
             return 0, 0, 0
             
         self.logger.debug(f"开始批量处理 {len(image_paths)} 张图片")
         
         total_processed = 0
-        total_faces_processed = 0  # 实际经过马赛克处理的人脸数量
-        total_plates_processed = 0  # 实际经过马赛克处理的车牌数量
+        total_faces_processed = 0
+        total_plates_processed = 0
         
-        # 批量读取图片
-        images = []
-        valid_paths = []
-        
+        # 处理每个图片路径
         for img_path in image_paths:
-            img = cv2.imread(img_path)
-            if img is not None:
-                images.append(img)
-                valid_paths.append(img_path)
-            else:
-                self.logger.error(f"无法读取图片: {img_path}")
-        
-        if not images:
-            return 0, 0, 0
-        
-        # 批量处理每张图片
-        for i, (img, img_path) in enumerate(zip(images, valid_paths)):
-            # 检测并处理人脸
-            print("img_shape", img.shape)
-            img, faces_count, _ = self.detect_faces(img)
-            total_faces_processed += faces_count
-            
-            # 检测并处理车牌
-            img, plates_count, _ = self.detect_plates(img)
-            total_plates_processed += plates_count
-            
-            # 保存结果
-            filename = os.path.basename(img_path)
-            output_path = os.path.join(self.output_dir, filename)
-            cv2.imwrite(output_path, img)
-            
-            total_processed += 1
+            try:
+                img = cv2.imread(img_path)
+                if img is None:
+                    self.logger.error(f"无法读取图片: {img_path}")
+                    continue
+                
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                
+                # 检测并处理人脸
+                processed_img, faces_count, _ = self.detect_faces(img_rgb)
+                total_faces_processed += faces_count
+                
+                # 检测并处理车牌
+                processed_img, plates_count, _ = self.detect_plates(processed_img)
+                total_plates_processed += plates_count
+                
+                # 保存处理后的图片
+                filename = os.path.basename(img_path)
+                output_path = os.path.join(self.output_dir, filename)
+                processed_img_bgr = cv2.cvtColor(processed_img, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(output_path, processed_img_bgr)
+                
+                total_processed += 1
+                
+            except Exception as e:
+                self.logger.error(f"处理图片 {img_path} 时出错: {str(e)}")
+                continue
         
         self.logger.info(f"批处理完成: {total_processed} 张图片, "
                         f"人脸 {total_faces_processed} 个, 车牌 {total_plates_processed} 个")
         return total_processed, total_faces_processed, total_plates_processed
 
-def batch_process_images(input_dir, output_dir, face_detector, plate_detector):
-    """批量处理目录中的所有图片（使用16张批处理优化）"""
+def batch_process_images(input_dir, output_dir, face_detector, plate_detector, batch_size=16):
+    """批量处理目录中的所有图片（使用数据集和DataLoader优化）"""
     logger = logging.getLogger('VideoProcessor.batch_process_images')
     
-    # 获取图片
-    image_extensions = ['jpg', 'jpeg', 'png', 'bmp', 'tiff', 'webp']
-    image_paths = []
-    for ext in image_extensions:
-        image_paths.extend(glob.glob(os.path.join(input_dir, f'*.{ext}')))
-
-    if not image_paths:
+    # 创建数据集实例
+    dataset = VideoFrameDataset(input_dir)
+    
+    if len(dataset) == 0:
         logger.info(f"在目录 '{input_dir}' 中未找到图片文件")
         return 0, 0, 0
     
-    # 初始化处理器
-    processor = CombinedProcessor(face_detector, plate_detector, output_dir)
+    # 创建DataLoader
+    dataloader = dataset.get_dataloader(batch_size=batch_size, num_workers=0, shuffle=False)
     
-    total_images = len(image_paths)
-    batch_size = 64
+    # 初始化处理器
+    processor = CombinedProcessor(face_detector, plate_detector, output_dir, debug_mode=False)
+    
+    total_images = len(dataset)
     total_processed = 0
     total_faces = 0
     total_plates = 0
     
-    logger.info(f"开始批量处理 {total_images} 张图片（每批16张）")
+    logger.info(f"开始批量处理 {total_images} 张图片（每批{batch_size}张）")
     batch_start_time = time.time()
     
-    # 按16张为一批进行处理
-    for batch_start in range(0, total_images, batch_size):
-        batch_end = min(batch_start + batch_size, total_images)
-        batch_files = image_paths[batch_start:batch_end]
+    # 使用DataLoader进行批次处理
+    processed_batches = 0
+    for batch_idx, (batch_images, batch_paths) in enumerate(dataloader):
+        batch_start_idx = time.time()
         
-        # 批量处理当前批次
-        batch_processed, batch_faces, batch_plates = processor.process_images_batch(batch_files)
+        # 处理当前批次
+        batch_processed, batch_faces, batch_plates = processor.process_images_batch_dataloader(
+            batch_images, batch_paths
+        )
         
         total_processed += batch_processed
         total_faces += batch_faces
         total_plates += batch_plates
+        processed_batches += 1
+        
+        # 显示进度（每5个批次显示一次）
+        if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == len(dataloader):
+            progress = (batch_idx + 1) / len(dataloader) * 100
+            logger.info(f"处理进度: {progress:.1f}% ({batch_idx + 1}/{len(dataloader)} 批次)")
     
     # 打印批处理统计信息
     batch_total_time = time.time() - batch_start_time
+    avg_time_per_image = batch_total_time / total_processed if total_processed > 0 else 0
+    
     logger.info(f"批处理完成! 共处理 {total_processed}/{total_images} 张图片")
-    logger.info(f"批处理总耗时: {batch_total_time:.2f}秒 | "
-                f"总人脸: {total_faces} | 总车牌: {total_plates}")
+    logger.info(f"批处理总耗时: {batch_total_time:.2f}秒 | 平均: {avg_time_per_image:.3f}秒/张")
+    if total_faces > 0 or total_plates > 0:
+        logger.info(f"检测结果: {total_faces} 个人脸, {total_plates} 个车牌")
     
     return total_processed, total_faces, total_plates
 
@@ -729,22 +824,80 @@ def create_video(frame_dir, output_path, fps=30):
     
     # 确定输出视频编码器
     ext = os.path.splitext(output_path)[1].lower()
-    if ext in ['.mp4', '.m4v']:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    elif ext in ['.avi']:
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    elif ext in ['.h265', '.hevc']:
-        fourcc = cv2.VideoWriter_fourcc(*'HEVC')
+    
+    # 定义编码器优先级列表
+    codec_priority = {
+        '.mp4': [('mp4v', 'mp4v'), ('avc1', 'H.264'), ('X264', 'H.264')],
+        '.m4v': [('mp4v', 'mp4v'), ('avc1', 'H.264')],
+        '.avi': [('XVID', 'XVID'), ('MJPG', 'MJPEG')],
+        '.h265': [('HEVC', 'HEVC'), ('avc1', 'H.264')],
+        '.hevc': [('HEVC', 'HEVC'), ('avc1', 'H.264')],
+        '.mkv': [('mp4v', 'mp4v'), ('avc1', 'H.264'), ('XVID', 'XVID')]
+    }
+    
+    fourcc = None
+    codec_name = ""
+    
+    # 根据扩展名获取编码器列表
+    if ext in codec_priority:
+        codecs = codec_priority[ext]
     else:
-        logger.warning(f"不支持的视频格式 {ext}，使用默认编码器")
+        logger.warning(f"不支持的视频格式 {ext}，使用默认MP4格式")
+        ext = '.mp4'
+        codecs = codec_priority[ext]
+        output_path = os.path.splitext(output_path)[0] + '.mp4'
+    
+    # 测试可用的编码器
+    for codec_code, codec_desc in codecs:
+        test_fourcc = cv2.VideoWriter_fourcc(*codec_code)
+        test_path = output_path + f'.test_{codec_code}'
+        test_writer = cv2.VideoWriter(test_path, test_fourcc, fps, (width, height))
+        
+        if test_writer.isOpened():
+            test_writer.release()
+            fourcc = test_fourcc
+            codec_name = codec_desc
+            try:
+                os.remove(test_path)
+            except:
+                pass
+            logger.info(f"使用编码器: {codec_desc} ({codec_code})")
+            break
+        else:
+            test_writer.release()
+            try:
+                os.remove(test_path)
+            except:
+                pass
+    
+    # 如果所有编码器都不可用，使用最通用的MP4V
+    if fourcc is None:
+        logger.warning("所有编码器都不可用，使用默认MP4V编码器")
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         output_path = os.path.splitext(output_path)[0] + '.mp4'
+        codec_name = "MP4V"
     
     # 创建视频写入器
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     if not out.isOpened():
         logger.error(f"无法创建视频写入器: {output_path}")
-        return False
+        logger.error(f"编码器信息: fourcc={fourcc}, 尺寸={width}x{height}, fps={fps}")
+        logger.error("可能的解决方案:")
+        logger.error("1. 安装FFmpeg并添加到系统PATH")
+        logger.error("2. 使用管理员权限运行程序")
+        logger.error("3. 安装OpenCV的完整版本: pip install opencv-python-headless")
+        logger.error("4. 使用MP4格式输出")
+        
+        # 尝试使用备用编码器
+        backup_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        backup_path = os.path.splitext(output_path)[0] + '_backup.mp4'
+        out = cv2.VideoWriter(backup_path, backup_fourcc, fps, (width, height))
+        if out.isOpened():
+            logger.info(f"使用备用编码器成功创建: {backup_path}")
+            output_path = backup_path
+        else:
+            logger.error("备用编码器也创建失败")
+            return False
     
     # 写入帧
     total_frames = len(frame_files)
@@ -769,7 +922,7 @@ def create_video(frame_dir, output_path, fps=30):
     logger.info(f"视频合成完成: {output_path}")
     return True
 
-def process_video_pipeline(input_video_path, output_video_path, face_detector, plate_detector, temp_dir="temp_processing", fps=60):
+def process_video_pipeline(input_video_path, output_video_path, face_detector, plate_detector, temp_dir="temp_processing", fps=60, batch_size=16):
     """完整的视频处理流程：视频 -> 图片 -> 批处理 -> 视频"""
     logger = logging.getLogger('VideoProcessor.pipeline')
     
@@ -796,7 +949,7 @@ def process_video_pipeline(input_video_path, output_video_path, face_detector, p
     logger.info("步骤2: 批处理图片...")
     batch_start = time.time()
     processed_frames, total_faces_processed, total_plates_processed = batch_process_images(
-        frame_dir, processed_dir, face_detector, plate_detector
+        frame_dir, processed_dir, face_detector, plate_detector, batch_size
     )
     batch_time = time.time() - batch_start
     
@@ -820,7 +973,7 @@ def process_video_pipeline(input_video_path, output_video_path, face_detector, p
     
     return True, processed_frames, total_faces_processed, total_plates_processed
 
-def process_single_video(video_path, output_videos_dir, face_detector, plate_detector, temp_base_dir, cleanup=True):
+def process_single_video(video_path, output_videos_dir, face_detector, plate_detector, temp_base_dir, cleanup=True, batch_size=16):
     """处理单个视频的完整流程"""
     logger = logging.getLogger('VideoProcessor.process_single_video')
     video_filename = os.path.basename(video_path)
@@ -848,7 +1001,8 @@ def process_single_video(video_path, output_videos_dir, face_detector, plate_det
             face_detector=face_detector,
             plate_detector=plate_detector,
             temp_dir=video_temp_dir,
-            fps=60
+            fps=60,
+            batch_size=batch_size
         )
         
         if success:
@@ -899,6 +1053,7 @@ def load_config(config_file='config.ini'):
     paths = config['PATHS']
     required_keys = [
         'model_weights', 
+        'mtcnn_model_path',
         'record_dir',
         'output_h265_dir',
         'output_videos_dir', 
@@ -917,13 +1072,16 @@ def load_config(config_file='config.ini'):
         video_formats = [ext.strip() for ext in video_formats.split(',')]
         cleanup_temp = settings.getboolean('cleanup_temp', True)
         copy_unprocessed = settings.getboolean('copy_unprocessed_videos', True)
+        batch_size = settings.getint('batch_size', 16)
     else:
         video_formats = ['h265', 'hevc', '265', 'mp4', 'mov', 'avi']
         cleanup_temp = True
         copy_unprocessed = True
+        batch_size = 16
     
     return {
         'model_weights': paths['model_weights'],
+        'mtcnn_model_path': paths['mtcnn_model_path'],
         'record_dir': paths['record_dir'],
         'output_h265_dir': paths['output_h265_dir'],
         'output_videos_dir': paths['output_videos_dir'],
@@ -931,7 +1089,8 @@ def load_config(config_file='config.ini'):
         'record_output_dir': paths['record_output_dir'],
         'video_formats': video_formats,
         'cleanup_temp': cleanup_temp,
-        'copy_unprocessed': copy_unprocessed
+        'copy_unprocessed': copy_unprocessed,
+        'batch_size': batch_size
     }
 
 def process_mf4(file_path, output_dir):
@@ -986,6 +1145,7 @@ if __name__ == "__main__":
         
         # 获取配置参数
         plate_model_path = config['model_weights']
+        mtcnn_model_path = config['mtcnn_model_path']
         record_dir = config['record_dir']
         output_h265_dir = config['output_h265_dir']
         output_videos_dir = config['output_videos_dir']
@@ -994,16 +1154,34 @@ if __name__ == "__main__":
         video_formats = config['video_formats']
         cleanup_temp = config['cleanup_temp']
         copy_unprocessed = config['copy_unprocessed']
+        batch_size = config['batch_size']
         input_videos_dir = os.path.join(output_h265_dir, "hevcs")
         
         logger.info("配置参数:")
         logger.info(f"模型权重: {plate_model_path}")
+        logger.info(f"MTCNN模型路径: {mtcnn_model_path}")
         logger.info(f"record输入: {record_dir}")
         logger.info(f"视频输入目录: {input_videos_dir}")
         logger.info(f"视频输出目录: {output_videos_dir}")
         logger.info(f"临时目录: {temp_directory_base}")
         logger.info(f"record打包路径: {record_output_dir}")
         logger.info(f"支持格式: {', '.join(video_formats)}")
+        logger.info(f"批处理大小: {batch_size}")
+        
+        # 检查可用编码器
+        logger.info("检查系统可用视频编码器...")
+        available_codecs = check_available_codecs()
+        if available_codecs:
+            logger.info("可用编码器: " + ", ".join([f"{name}({code})" for code, name in available_codecs]))
+        else:
+            logger.warning("未检测到可用编码器，请安装FFmpeg")
+        
+       # 解包record文件，获取摄像头数据
+        logger.info("开始解包数据...")
+        # 使用模拟的recordDeal，实际使用时替换为真实模块
+        recordDeal = MockRecordDeal()
+        result1 = recordDeal.read_record2h265_all(record_dir, output_h265_dir)
+        logger.info(f"解包完成")
         
         # 初始化模型
         logger.info("开始初始化检测模型...")
@@ -1015,12 +1193,12 @@ if __name__ == "__main__":
             gpu_name = torch.cuda.get_device_name(0)
             logger.info(f"检测到GPU: {gpu_count}个 - {gpu_name}")
         else:
-            logger.info("未检测到GPU，将使用CPU")
+            logger.info("未检测到GPU,将使用CPU")
         
         # 初始化MTCNN人脸检测模型
         logger.info("正在加载MTCNN人脸检测模型...")
-        # 请替换为实际的MTCNN模型路径
-        face_detector = MTCNN(model_path="/mnt/d/P_WorkSpace/Video-desensitization/mtcnn")
+        logger.info(f"MTCNN模型路径: {mtcnn_model_path}")
+        face_detector = MTCNN(model_path=mtcnn_model_path)
         device = face_detector.device
         print(f"face模型运行设备: {device}")
         logger.info("MTCNN人脸检测模型加载完成")
@@ -1045,12 +1223,7 @@ if __name__ == "__main__":
         os.makedirs(temp_directory_base, exist_ok=True)
         logger.info(f"临时根目录已创建/确认: {temp_directory_base}")
         
-        # 解包record文件，获取摄像头数据
-        logger.info("开始解包数据...")
-        # 使用模拟的recordDeal，实际使用时替换为真实模块
-        recordDeal = MockRecordDeal()
-        result1 = recordDeal.read_record2h265_all(record_dir, output_h265_dir)
-        logger.info(f"解包完成")
+        
         
         # 开始文件处理
         logger.info(f"在目录 {input_videos_dir} 中查找文件...")
@@ -1071,6 +1244,7 @@ if __name__ == "__main__":
         skip_count = 0
         mf4_count = 0
         
+
         # 处理每个文件
         for i, file_path in enumerate(all_files, 1):
             filename = os.path.basename(file_path)
@@ -1092,7 +1266,7 @@ if __name__ == "__main__":
                 logger.info(f"处理视频文件 (.{file_ext})")
                 success = process_single_video(
                     file_path, output_videos_dir, 
-                    face_detector, plate_detector, temp_directory_base, cleanup_temp
+                    face_detector, plate_detector, temp_directory_base, cleanup_temp, batch_size
                 )
                 if success:
                     success_count += 1
@@ -1111,7 +1285,9 @@ if __name__ == "__main__":
             else:
                 logger.info(f"跳过不符合格式的文件")
                 skip_count += 1
-
+        model_end_time = time.time()
+        total_model_time = model_end_time - start_init_time
+        logger.info(f"\n模型运行总耗时: {total_model_time:.2f}秒")
         # record文件打包
         logger.info("开始重新打包record文件...")
         result2 = recordDeal.write_allH265_record_all(record_dir, output_videos_dir, record_output_dir)

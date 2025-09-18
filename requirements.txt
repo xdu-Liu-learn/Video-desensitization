@@ -113,5 +113,5 @@ huggingface-hub==0.23.2
 safetensors==0.4.3
 numpy==1.26.4
 supervision==0.22.0
-mtcnn==0.1.1
+
 

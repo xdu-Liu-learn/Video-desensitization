@@ -5,6 +5,8 @@ Blur the faces and license plates in the video.
     #GPU RTX5090算力过高，目前适配cuda12.8以及torch2.7版本，cudnn8.9.6
     conda  create -n FLPR python=3.10
     export LD_LIBRARY_PATH=/path/to/library:$LD_LIBRARY_PATH #配置recordDeal库，/path/to/library为.so文件所处目录
+    source ~/.bashrc
+    conda activate FLPR
     pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
     pip install -r requirements.txt
     wget https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.4.11/flash_attn-2.8.3+cu128torch2.7-cp310-cp310-linux_x86_64.whl

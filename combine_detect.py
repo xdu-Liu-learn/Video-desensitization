@@ -9,393 +9,13 @@ import torch
 from ultralytics import YOLO
 import logging
 import sys
-from skimage import transform as trans
-from dataloader import VideoFrameDataset
-
-class MTCNN:
-    def __init__(self, model_path):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # 获取P模型
-        self.pnet = torch.jit.load(os.path.join(model_path, 'PNet.pth'))
-        self.pnet.to(self.device)
-        self.softmax_p = torch.nn.Softmax(dim=0)
-        self.pnet.eval()
-
-        # 获取R模型
-        self.rnet = torch.jit.load(os.path.join(model_path, 'RNet.pth'))
-        self.rnet.to(self.device)
-        self.softmax_r = torch.nn.Softmax(dim=-1)
-        self.rnet.eval()
-
-        # 获取O模型
-        self.onet = torch.jit.load(os.path.join(model_path, 'ONet.pth'))
-        self.onet.to(self.device)
-        self.softmax_o = torch.nn.Softmax(dim=-1)
-        self.onet.eval()
-
-    # 使用PNet模型预测
-    def predict_pnet(self,infer_data):
-        infer_data = torch.tensor(infer_data, dtype=torch.float32, device=self.device)
-        infer_data = torch.unsqueeze(infer_data, dim=0)
-        cls_prob, bbox_pred, _ = self.pnet(infer_data)
-        cls_prob = torch.squeeze(cls_prob)
-        cls_prob = self.softmax_p(cls_prob)
-        bbox_pred = torch.squeeze(bbox_pred)
-        return cls_prob.detach().cpu().numpy(), bbox_pred.detach().cpu().numpy()
-
-    # 使用RNet模型预测
-    def predict_rnet(self,infer_data):
-        infer_data = torch.tensor(infer_data, dtype=torch.float32, device=self.device)
-        cls_prob, bbox_pred, _ = self.rnet(infer_data)
-        cls_prob = self.softmax_r(cls_prob)
-        return cls_prob.detach().cpu().numpy(), bbox_pred.detach().cpu().numpy()
-
-    # 使用ONet模型预测
-    def predict_onet(self,infer_data):
-        infer_data = torch.tensor(infer_data, dtype=torch.float32, device=self.device)
-        cls_prob, bbox_pred, landmark_pred = self.onet(infer_data)
-        cls_prob = self.softmax_o(cls_prob)
-        return cls_prob.detach().cpu().numpy(), bbox_pred.detach().cpu().numpy(), landmark_pred.detach().cpu().numpy()
-
-    # 获取PNet网络输出结果
-    def detect_pnet(self,im, min_face_size, scale_factor, thresh):
-        net_size = 12
-        current_scale = float(net_size) / min_face_size
-        im_resized = self.processed_image(im, current_scale)
-        _, current_height, current_width = im_resized.shape
-        all_boxes = list()
-        
-        while min(current_height, current_width) > net_size:
-            cls_cls_map, reg = self.predict_pnet(im_resized)
-            boxes = self.generate_bbox(cls_cls_map[1, :, :], reg, current_scale, thresh)
-            current_scale *= scale_factor
-            im_resized = self.processed_image(im, current_scale)
-            _, current_height, current_width = im_resized.shape
-
-            if boxes.size == 0:
-                continue
-            
-            keep = self.py_nms(boxes[:, :5], 0.5, mode='Union')
-            boxes = boxes[keep]
-            all_boxes.append(boxes)
-        
-        if len(all_boxes) == 0:
-            return None
-        
-        all_boxes = np.vstack(all_boxes)
-        keep = self.py_nms(all_boxes[:, 0:5], 0.7, mode='Union')
-        all_boxes = all_boxes[keep]
-        
-        bbw = all_boxes[:, 2] - all_boxes[:, 0] + 1
-        bbh = all_boxes[:, 3] - all_boxes[:, 1] + 1
-        
-        boxes_c = np.vstack([all_boxes[:, 0] + all_boxes[:, 5] * bbw,
-                             all_boxes[:, 1] + all_boxes[:, 6] * bbh,
-                             all_boxes[:, 2] + all_boxes[:, 7] * bbw,
-                             all_boxes[:, 3] + all_boxes[:, 8] * bbh,
-                             all_boxes[:, 4]])
-        boxes_c = boxes_c.T
-
-        return boxes_c
-
-    # 获取RNet网络输出结果
-    def detect_rnet(self,im, dets, thresh):
-        h, w, c = im.shape
-        dets = self.convert_to_square(dets)
-        dets[:, 0:4] = np.round(dets[:, 0:4])
-        
-        [dy, edy, dx, edx, y, ey, x, ex, tmpw, tmph] = self.pad(dets, w, h)
-        delete_size = np.ones_like(tmpw) * 20
-        ones = np.ones_like(tmpw)
-        zeros = np.zeros_like(tmpw)
-        num_boxes = np.sum(np.where((np.minimum(tmpw, tmph) >= delete_size), ones, zeros))
-        cropped_ims = np.zeros((int(num_boxes), 3, 24, 24), dtype=np.float32)
-        
-        for i in range(int(num_boxes)):
-            if tmph[i] < 20 or tmpw[i] < 20:
-                continue
-            tmp = np.zeros((tmph[i], tmpw[i], 3), dtype=np.uint8)
-            try:
-                tmp[dy[i]:edy[i] + 1, dx[i]:edx[i] + 1, :] = im[y[i]:ey[i] + 1, x[i]:ex[i] + 1, :]
-                img = cv2.resize(tmp, (24, 24), interpolation=cv2.INTER_LINEAR)
-                img = img.transpose((2, 0, 1))
-                img = (img - 127.5) / 128
-                cropped_ims[i, :, :, :] = img
-            except:
-                continue
-        
-        cls_scores, reg = self.predict_rnet(cropped_ims)
-        cls_scores = cls_scores[:, 1]
-        keep_inds = np.where(cls_scores > thresh)[0]
-        
-        if len(keep_inds) > 0:
-            boxes = dets[keep_inds]
-            boxes[:, 4] = cls_scores[keep_inds]
-            reg = reg[keep_inds]
-        else:
-            return None
-
-        keep = self.py_nms(boxes, 0.4, mode='Union')
-        boxes = boxes[keep]
-        boxes_c = self.calibrate_box(boxes, reg[keep])
-        return boxes_c
-
-    # 获取ONet模型预测结果
-    def detect_onet(self,im, dets, thresh):
-        h, w, c = im.shape
-        dets = self.convert_to_square(dets)
-        dets[:, 0:4] = np.round(dets[:, 0:4])
-        
-        [dy, edy, dx, edx, y, ey, x, ex, tmpw, tmph] = self.pad(dets, w, h)
-        num_boxes = dets.shape[0]
-        cropped_ims = np.zeros((num_boxes, 3, 48, 48), dtype=np.float32)
-        
-        for i in range(num_boxes):
-            tmp = np.zeros((tmph[i], tmpw[i], 3), dtype=np.uint8)
-            tmp[dy[i]:edy[i] + 1, dx[i]:edx[i] + 1, :] = im[y[i]:ey[i] + 1, x[i]:ex[i] + 1, :]
-            img = cv2.resize(tmp, (48, 48), interpolation=cv2.INTER_LINEAR)
-            img = img.transpose((2, 0, 1))
-            img = (img - 127.5) / 128
-            cropped_ims[i, :, :, :] = img
-        
-        cls_scores, reg, landmark = self.predict_onet(cropped_ims)
-        cls_scores = cls_scores[:, 1]
-        keep_inds = np.where(cls_scores > thresh)[0]
-        
-        if len(keep_inds) > 0:
-            boxes = dets[keep_inds]
-            boxes[:, 4] = cls_scores[keep_inds]
-            reg = reg[keep_inds]
-            landmark = landmark[keep_inds]
-        else:
-            return None, None
-
-        w = boxes[:, 2] - boxes[:, 0] + 1
-        h = boxes[:, 3] - boxes[:, 1] + 1
-        
-        landmark[:, 0::2] = (np.tile(w, (5, 1)) * landmark[:, 0::2].T + np.tile(boxes[:, 0], (5, 1)) - 1).T
-        landmark[:, 1::2] = (np.tile(h, (5, 1)) * landmark[:, 1::2].T + np.tile(boxes[:, 1], (5, 1)) - 1).T
-        boxes_c = self.calibrate_box(boxes, reg)
-
-        keep = self.py_nms(boxes_c, 0.6, mode='Minimum')
-        boxes_c = boxes_c[keep]
-        landmark = landmark[keep]
-        return boxes_c, landmark
-
-    def infer_image_path(self, image_path):
-        im = cv2.imread(image_path)
-        boxes_c = self.detect_pnet(im, 20, 0.79, 0.9)
-        if boxes_c is None:
-            return None, None
-        
-        boxes_c = self.detect_rnet(im, boxes_c, 0.6)
-        if boxes_c is None:
-            return None, None
-        
-        boxes_c, landmark = self.detect_onet(im, boxes_c, 0.7)
-        if boxes_c is None:
-            return None, None
-
-        return boxes_c, landmark
-
-    # 对齐
-    @staticmethod
-    def estimate_norm(lmk):
-        assert lmk.shape == (5, 2)
-        tform = trans.SimilarityTransform()
-        src = np.array([[38.2946, 51.6963],
-                        [73.5318, 51.5014],
-                        [56.0252, 71.7366],
-                        [41.5493, 92.3655],
-                        [70.7299, 92.2041]], dtype=np.float32)
-        tform.estimate(lmk, src)
-        M = tform.params[0:2, :]
-        return M
-
-    def norm_crop(self, img, landmark, image_size=112):
-        M = self.estimate_norm(landmark)
-        warped = cv2.warpAffine(img, M, (image_size, image_size), borderValue=0.0)
-        return warped
-
-    def infer_image(self, im):
-        if isinstance(im, str):
-            im = cv2.imread(im)
-            
-        boxes_c = self.detect_pnet(im, 20, 0.79, 0.95)  # 提高PNet阈值
-        if boxes_c is None:
-            return None, None
-        
-        boxes_c = self.detect_rnet(im, boxes_c, 0.8)  # 提高RNet阈值
-        if boxes_c is None:
-            return None, None
-        
-        boxes_c, landmarks = self.detect_onet(im, boxes_c, 0.9)  # 提高ONet阈值
-        if boxes_c is None:
-            return None, None
-            
-        faces = []
-        for i, box in enumerate(boxes_c):
-            x1, y1, x2, y2, score = box.astype(int)
-            face = {
-                'box': [x1, y1, x2-x1, y2-y1],
-                'confidence': score,
-                'keypoints': {}
-            }
-            
-            # 处理关键点
-            if landmarks is not None and i < len(landmarks):
-                landmark = landmarks[i]
-                face['keypoints'] = {
-                    'left_eye': (landmark[0], landmark[1]),
-                    'right_eye': (landmark[2], landmark[3]),
-                    'nose': (landmark[4], landmark[5]),
-                    'mouth_left': (landmark[6], landmark[7]),
-                    'mouth_right': (landmark[8], landmark[9])
-                }
-                
-            faces.append(face)
-
-        return faces, boxes_c
-
-    # 工具函数
-    @staticmethod
-    def generate_bbox(cls_map, reg, scale, thresh):
-        stride = 2
-        cellsize = 12
-
-        cls_map = np.transpose(cls_map)
-        dx1 = np.transpose(reg[0, :, :])
-        dy1 = np.transpose(reg[1, :, :])
-        dx2 = np.transpose(reg[2, :, :])
-        dy2 = np.transpose(reg[3, :, :])
-
-        (y, x) = np.where(cls_map >= thresh)
-        if y.size == 0:
-            return np.array([])
-        
-        score = np.array([cls_map[i, j] for i, j in zip(y, x)])
-        regx1 = np.array([dx1[i, j] for i, j in zip(y, x)])
-        regy1 = np.array([dy1[i, j] for i, j in zip(y, x)])
-        regx2 = np.array([dx2[i, j] for i, j in zip(y, x)])
-        regy2 = np.array([dy2[i, j] for i, j in zip(y, x)])
-        
-        x1 = np.round((x * stride + 1) / scale)
-        y1 = np.round((y * stride + 1) / scale)
-        x2 = np.round((x * stride + 1 + cellsize - 1) / scale)
-        y2 = np.round((y * stride + 1 + cellsize - 1) / scale)
-        
-        bbox = np.vstack([x1, y1, x2, y2, score, regx1, regy1, regx2, regy2])
-        return bbox.T
-
-    @staticmethod
-    def py_nms(dets, thresh, mode='Union'):
-        x1 = dets[:, 0]
-        y1 = dets[:, 1]
-        x2 = dets[:, 2]
-        y2 = dets[:, 3]
-        scores = dets[:, 4]
-
-        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
-        order = scores.argsort()[::-1]
-
-        keep = []
-        while order.size > 0:
-            i = order[0]
-            keep.append(i)
-            xx1 = np.maximum(x1[i], x1[order[1:]])
-            yy1 = np.maximum(y1[i], y1[order[1:]])
-            xx2 = np.minimum(x2[i], x2[order[1:]])
-            yy2 = np.minimum(y2[i], y2[order[1:]])
-
-            w = np.maximum(0.0, xx2 - xx1 + 1)
-            h = np.maximum(0.0, yy2 - yy1 + 1)
-            inter = w * h
-            
-            if mode == 'Union':
-                ovr = inter / (areas[i] + areas[order[1:]] - inter)
-            else:
-                ovr = inter / np.minimum(areas[i], areas[order[1:]])
-
-            inds = np.where(ovr <= thresh)[0]
-            order = order[inds + 1]
-
-        return keep
-
-    @staticmethod
-    def convert_to_square(bbox):
-        square_bbox = bbox.copy()
-        h = bbox[:, 3] - bbox[:, 1] + 1
-        w = bbox[:, 2] - bbox[:, 0] + 1
-        max_side = np.maximum(h, w)
-        
-        square_bbox[:, 0] = bbox[:, 0] + w * 0.5 - max_side * 0.5
-        square_bbox[:, 1] = bbox[:, 1] + h * 0.5 - max_side * 0.5
-        square_bbox[:, 2] = square_bbox[:, 0] + max_side - 1
-        square_bbox[:, 3] = square_bbox[:, 1] + max_side - 1
-        
-        return square_bbox
-
-    @staticmethod
-    def pad(bboxes, w, h):
-        tmpw = (bboxes[:, 2] - bboxes[:, 0] + 1).astype(np.int32)
-        tmph = (bboxes[:, 3] - bboxes[:, 1] + 1).astype(np.int32)
-        num_boxes = bboxes.shape[0]
-
-        dx = np.zeros((num_boxes,))
-        dy = np.zeros((num_boxes,))
-        edx = tmpw - 1
-        edy = tmph - 1
-
-        x = bboxes[:, 0].astype(np.int32)
-        y = bboxes[:, 1].astype(np.int32)
-        x2 = bboxes[:, 2].astype(np.int32)
-        y2 = bboxes[:, 3].astype(np.int32)
-
-        # 处理边界
-        for i in range(num_boxes):
-            if x[i] < 0:
-                dx[i] = -x[i]
-                x[i] = 0
-            if y[i] < 0:
-                dy[i] = -y[i]
-                y[i] = 0
-            if x2[i] >= w:
-                edx[i] = tmpw[i] - 1 - (x2[i] - w + 1)
-                x2[i] = w - 1
-            if y2[i] >= h:
-                edy[i] = tmph[i] - 1 - (y2[i] - h + 1)
-                y2[i] = h - 1
-
-        return dy, edy, dx, edx, y, y2, x, x2, tmpw, tmph
-
-    @staticmethod
-    def calibrate_box(bbox, reg):
-        w = bbox[:, 2] - bbox[:, 0] + 1
-        h = bbox[:, 3] - bbox[:, 1] + 1
-        cx = bbox[:, 0] + w * 0.5
-        cy = bbox[:, 1] + h * 0.5
-
-        cx1 = cx + reg[:, 0] * w
-        cy1 = cy + reg[:, 1] * h
-        cx2 = cx + reg[:, 2] * w
-        cy2 = cy + reg[:, 3] * h
-
-        bbox[:, 0] = cx1 - w * 0.5
-        bbox[:, 1] = cy1 - h * 0.5
-        bbox[:, 2] = cx2 - w * 0.5 + w - 1
-        bbox[:, 3] = cy2 - h * 0.5 + h - 1
-        
-        return bbox
-
-    @staticmethod
-    def processed_image(img, scale):
-        h, w, c = img.shape
-        new_h = int(h * scale)
-        new_w = int(w * scale)
-        img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        img_resized = img_resized.transpose((2, 0, 1))
-        img_resized = (img_resized - 127.5) / 128
-        return img_resized
+# from skimage import transform as trans
+# from dataloader import VideoFrameDataset
+import subprocess
+from concurrent.futures import ThreadPoolExecutor,as_completed
+from detect_face.face import Retinaface
+from foreign import recordDeal  
+import tarfile
 
 # 配置全局日志器
 def setup_logger(log_file='video_processing.log'):
@@ -468,343 +88,395 @@ def check_available_codecs():
     
     return available_codecs
     
-class CombinedProcessor:
-    def __init__(self, face_detector, plate_detector, output_dir, debug_mode=False):
-        self.face_detector = face_detector
-        self.plate_detector = plate_detector
-        self.output_dir = output_dir
-        self.debug_mode = debug_mode
-        self.logger = logging.getLogger('VideoProcessor.CombinedProcessor')
-        os.makedirs(output_dir, exist_ok=True)
-        self.logger.info(f"输出目录已创建: {output_dir}")
-        
-        # 检查GPU使用情况
-        self.check_gpu_usage()
-        
-        # 将模型迁移到GPU（如果可用）
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        if torch.cuda.is_available():
-            self.logger.info(f"将模型迁移到GPU设备: {self.device}")
-        
-    def check_gpu_usage(self):
-        """检查模型是否使用GPU运行"""
-        # 检查YOLOv8是否使用GPU
-        if torch.cuda.is_available():
-            yolo_device = next(self.plate_detector.model.parameters()).device
-            self.logger.info(f"YOLOv8车牌检测模型运行在: {yolo_device}")
-        else:
-            self.logger.info("YOLOv8车牌检测模型运行在: CPU")
-        
-        # 检查MTCNN设备
-        mtcnn_device = self.face_detector.device
-        self.logger.info(f"MTCNN人脸检测模型运行在: {mtcnn_device}")
-        
-    def get_optimal_ellipse(self, face, img_shape):
-        """计算刚好包含人脸的椭圆参数"""
-        x, y, w, h = face['box']
-        keypoints = face['keypoints']
-        
-        # 初始椭圆：基于矩形框的中心和轴长
-        center = (x + w // 2, y + h // 2)
-        axes = (w // 2, h // 2)
-        
-        # 获取所有关键点坐标
-        points = np.array(list(keypoints.values()))
-        
-        # 动态调整椭圆轴长
-        for _ in range(2):
-            for (px, py) in points:
-                dx = (px - center[0]) / axes[0] if axes[0] > 0 else 0
-                dy = (py - center[1]) / axes[1] if axes[1] > 0 else 0
-                distance = dx**2 + dy**2
-                
-                if distance > 0.9:
-                    scale = min(1.1, 1 / (distance**0.5))
-                    axes = (int(axes[0] * scale), int(axes[1] * scale))
-        
-        # 限制椭圆不超出图像边界
-        axes = (
-            min(axes[0], center[0], img_shape[1] - center[0]),
-            min(axes[1], center[1], img_shape[0] - center[1])
-        )
-        
-        return center, axes
 
-    def mosaic_ellipse_region(self, img, center, axes):
-        """对椭圆区域进行马赛克处理"""
-        # 创建椭圆掩膜
-        mask = np.zeros(img.shape[:2], dtype=np.uint8)
-        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+
+def mosaic_rectangle_region(self, batch_imgs, x1, y1, x2, y2, mosaic_level=8):
+        """
+        对批量图像中的矩形区域打马赛克
+        Args:
+            batch_imgs: list of np.ndarray, shape (H, W, 3), RGB or BGR
+            x1, y1: 矩形左上角坐标
+            x2, y2: 矩形右下角坐标
+            mosaic_level: 马赛克强度，值越大块越大（建议 4~16）
+
+        Returns:
+            list of np.ndarray, 打码后的图像列表
+        """
+        mosaic_imgs = []
+
+        for img in batch_imgs:
+            img = img.copy()
+            h, w = img.shape[:2]
+
+            # 边界裁剪
+            x1_clipped = max(0, x1)
+            y1_clipped = max(0, y1)
+            x2_clipped = min(w, x2)
+            y2_clipped = min(h, y2)
+
+            # 检查有效区域
+            if x2_clipped > x1_clipped and y2_clipped > y1_clipped:
+                # 提取区域
+                area = img[y1_clipped:y2_clipped, x1_clipped:x2_clipped]
+
+                # 缩小 -> 放大 = 马赛克效果
+                small_h = max(1, (y2_clipped - y1_clipped) // mosaic_level)
+                small_w = max(1, (x2_clipped - x1_clipped) // mosaic_level)
+
+                small = cv2.resize(area, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+                mosaic = cv2.resize(small, (x2_clipped - x1_clipped, y2_clipped - y1_clipped),
+                                interpolation=cv2.INTER_NEAREST)
+                # 替换原图区域
+                img[y1_clipped:y2_clipped, x1_clipped:x2_clipped] = mosaic
+
+            # 添加到结果列表
+            mosaic_imgs.append(img)
+
+        return mosaic_imgs
         
-        # 获取椭圆区域
-        x, y = max(0, center[0] - axes[0]), max(0, center[1] - axes[1])
-        w, h = min(2 * axes[0], img.shape[1] - x), min(2 * axes[1], img.shape[0] - y)
-        
-        if w > 0 and h > 0:
-            # 应用马赛克效果
-            region = img[y:y+h, x:x+w]
-            if region.size > 0:  # 确保区域有效
-                small = cv2.resize(region, (max(1, w//8), max(1, h//8)), interpolation=cv2.INTER_LINEAR)
-                mosaic = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
-                # 应用马赛克区域
-                mask_roi = mask[y:y+h, x:x+w]
-                img_roi = img[y:y+h, x:x+w]
-                img_roi[mask_roi == 255] = mosaic[mask_roi == 255]
-        
+  
+def mosaic_rectangle_region_single(img, x1, y1, x2, y2, mosaic_level=8):
+    """
+    对单张图像的矩形区域打马赛克
+    """
+    img = img.copy()
+    h, w = img.shape[:2]
+
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(w, x2)
+    y2 = min(h, y2)
+
+    if x2 <= x1 or y2 <= y1:
         return img
 
-    def mosaic_rectangle_region(self, img, x1, y1, x2, y2, mosaic_level=8):
-        """对矩形区域进行马赛克处理（用于车牌）"""
-        h, w = img.shape[:2]
-        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
-        
-        if x2 > x1 and y2 > y1:
-            area = img[y1:y2, x1:x2]
-            small = cv2.resize(area, (max(1, (x2-x1)//mosaic_level), max(1, (y2-y1)//mosaic_level)), 
-                              interpolation=cv2.INTER_NEAREST)
-            mosaic = cv2.resize(small, (x2-x1, y2-y1), interpolation=cv2.INTER_NEAREST)
-            img[y1:y2, x1:x2] = mosaic
-        
-        return img
+    area = img[y1:y2, x1:x2]
+    small_h = max(1, (y2 - y1) // mosaic_level)
+    small_w = max(1, (x2 - x1) // mosaic_level)
 
-    def detect_faces(self, img):
-        """检测人脸并应用马赛克"""
-        start_time = time.time()
-        faces, _ = self.face_detector.infer_image(img)
-        face_detection_time = time.time() - start_time
-        
-        faces_count = len(faces) if faces is not None else 0
-        
-        if faces is not None and faces_count > 0:
-            for face in faces:
-                center, axes = self.get_optimal_ellipse(face, img.shape)
-                img = self.mosaic_ellipse_region(img, center, axes)
-        
-        return img, faces_count, face_detection_time
+    small = cv2.resize(area, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+    mosaic = cv2.resize(small, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
+    img[y1:y2, x1:x2] = mosaic
 
-    def detect_plates(self, img):
-        """检测车牌并应用马赛克"""
-        start_time = time.time()
-        results = self.plate_detector(img, device=self.device, verbose=False, conf=0.5)  # 设置置信度阈值为0.5
-        car_detection_time = time.time() - start_time
+    return img
 
-        plates_count = 0
-        for result in results:
-            boxes = result.boxes
-            for box in boxes:
-                confidence = float(box.conf.cpu().numpy().squeeze())
-                if confidence >= 0.5:  # 只处理置信度>=0.5的检测结果
-                    x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy().squeeze().tolist())
-                    img = self.mosaic_rectangle_region(img, x1, y1, x2, y2)
-                    plates_count += 1
 
-        return img, plates_count, car_detection_time
+# -------------------------------
+# 图像加载函数（OpenCV + RGB 转换）
+# -------------------------------
+def load_image_rgb(image_path):
+    """ 使用 OpenCV 加载并转为 RGB numpy array """
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"无法读取图像: {image_path}")
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    def process_images_batch_dataloader(self, batch_images, batch_paths):
-        """使用DataLoader批量处理图片"""
-        if len(batch_images) == 0:
-            return 0, 0, 0
-            
-        batch_start_time = time.time()
-        
-        total_processed = 0
-        total_faces_processed = 0
-        total_plates_processed = 0
-        
-        # 处理批次中的每张图片
-        for i, (image, img_path) in enumerate(zip(batch_images, batch_paths)):
-            try:
-                # 确保图像是numpy数组
-                if isinstance(image, torch.Tensor):
-                    image = image.numpy()
-                
-                # 确保数据类型正确
-                if image.dtype != np.uint8:
-                    image = image.astype(np.uint8)
-                
-                # 检测并处理人脸
-                processed_img, faces_count, _ = self.detect_faces(image)
-                total_faces_processed += faces_count
-                
-                # 检测并处理车牌
-                processed_img, plates_count, _ = self.detect_plates(processed_img)
-                total_plates_processed += plates_count
-                
-                # 保存处理后的图片
-                filename = os.path.basename(str(img_path))
-                output_path = os.path.join(self.output_dir, filename)
-                
-                # 转换回BGR格式保存
-                processed_img_bgr = cv2.cvtColor(processed_img, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(output_path, processed_img_bgr)
-                
-                total_processed += 1
-                
-            except Exception as e:
-                self.logger.error(f"处理图片 {img_path} 时出错: {str(e)}")
-                continue
-        
-        batch_time = time.time() - batch_start_time
-        
-        # 批次级别的统计信息
-        if total_faces_processed > 0 or total_plates_processed > 0:
-            self.logger.info(f"批次处理完成: {total_processed} 张图片, "
-                           f"检测到 {total_faces_processed} 个人脸, {total_plates_processed} 个车牌 "
-                           f"| 耗时: {batch_time:.2f}s")
-        else:
-            self.logger.debug(f"批次处理完成: {total_processed} 张图片, 无检测目标 | 耗时: {batch_time:.2f}s")
-            
-        return total_processed, total_faces_processed, total_plates_processed
+# -------------------------------
+# 异步保存函数
+# -------------------------------
+def save_output_image(image_array, output_path):
+    """ 保存 RGB numpy 数组为图像 """
+    bgr_img = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(output_path, bgr_img)
 
-    def process_images_batch(self, image_paths):
-        """批量处理多张图片（16张批处理优化）- 已废弃，使用DataLoader版本"""
-        if not image_paths:
-            return 0, 0, 0
-            
-        self.logger.debug(f"开始批量处理 {len(image_paths)} 张图片")
-        
-        total_processed = 0
-        total_faces_processed = 0
-        total_plates_processed = 0
-        
-        # 处理每个图片路径
-        for img_path in image_paths:
-            try:
-                img = cv2.imread(img_path)
-                if img is None:
-                    self.logger.error(f"无法读取图片: {img_path}")
-                    continue
-                
-                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                
-                # 检测并处理人脸
-                processed_img, faces_count, _ = self.detect_faces(img_rgb)
-                total_faces_processed += faces_count
-                
-                # 检测并处理车牌
-                processed_img, plates_count, _ = self.detect_plates(processed_img)
-                total_plates_processed += plates_count
-                
-                # 保存处理后的图片
-                filename = os.path.basename(img_path)
-                output_path = os.path.join(self.output_dir, filename)
-                processed_img_bgr = cv2.cvtColor(processed_img, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(output_path, processed_img_bgr)
-                
-                total_processed += 1
-                
-            except Exception as e:
-                self.logger.error(f"处理图片 {img_path} 时出错: {str(e)}")
-                continue
-        
-        self.logger.info(f"批处理完成: {total_processed} 张图片, "
-                        f"人脸 {total_faces_processed} 个, 车牌 {total_plates_processed} 个")
-        return total_processed, total_faces_processed, total_plates_processed
 
 def batch_process_images(input_dir, output_dir, face_detector, plate_detector, batch_size=16):
-    """批量处理目录中的所有图片（使用数据集和DataLoader优化）"""
     logger = logging.getLogger('VideoProcessor.batch_process_images')
     
-    # 创建数据集实例
-    dataset = VideoFrameDataset(input_dir)
+    image_paths = [
+        os.path.join(input_dir, fname) for fname in os.listdir(input_dir)
+        if fname.lower().endswith(('.png', '.jpg', '.jpeg'))
+    ]
+    total_images = len(image_paths)
+    print(f"找到 {total_images} 张待处理图片。")
     
-    if len(dataset) == 0:
-        logger.info(f"在目录 '{input_dir}' 中未找到图片文件")
-        return 0, 0, 0
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"输出目录已创建: {output_dir}")
     
-    # 创建DataLoader
-    dataloader = dataset.get_dataloader(batch_size=batch_size, num_workers=0, shuffle=False)
-    
-    # 初始化处理器
-    processor = CombinedProcessor(face_detector, plate_detector, output_dir, debug_mode=False)
-    
-    total_images = len(dataset)
     total_processed = 0
     total_faces = 0
     total_plates = 0
     
-    logger.info(f"开始批量处理 {total_images} 张图片（每批{batch_size}张）")
-    batch_start_time = time.time()
-    
-    # 使用DataLoader进行批次处理
-    processed_batches = 0
-    for batch_idx, (batch_images, batch_paths) in enumerate(dataloader):
-        batch_start_idx = time.time()
-        
-        # 处理当前批次
-        batch_processed, batch_faces, batch_plates = processor.process_images_batch_dataloader(
-            batch_images, batch_paths
-        )
-        
-        total_processed += batch_processed
-        total_faces += batch_faces
-        total_plates += batch_plates
-        processed_batches += 1
-        
-        # 显示进度（每5个批次显示一次）
-        if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == len(dataloader):
-            progress = (batch_idx + 1) / len(dataloader) * 100
-            logger.info(f"处理进度: {progress:.1f}% ({batch_idx + 1}/{len(dataloader)} 批次)")
-    
-    # 打印批处理统计信息
-    batch_total_time = time.time() - batch_start_time
-    avg_time_per_image = batch_total_time / total_processed if total_processed > 0 else 0
-    
-    logger.info(f"批处理完成! 共处理 {total_processed}/{total_images} 张图片")
-    logger.info(f"批处理总耗时: {batch_total_time:.2f}秒 | 平均: {avg_time_per_image:.3f}秒/张")
-    if total_faces > 0 or total_plates > 0:
-        logger.info(f"检测结果: {total_faces} 个人脸, {total_plates} 个车牌")
-    
+    num_workers = 6
+    executor = ThreadPoolExecutor(max_workers=num_workers)
+    save_futures = []
+
+    for i in range(0, len(image_paths), batch_size):
+        batch_files = image_paths[i:i + batch_size]
+        batch_start_time = time.time()
+
+        # 多线程加载图像
+        load_start = time.time()
+        with ThreadPoolExecutor(max_workers=num_workers) as loader:
+            batch_images = list(loader.map(load_image_rgb, batch_files))
+        print("批处理中加载图像总耗时: {:.2f}s".format(time.time() - load_start))
+        # 并行执行两个模型
+        with ThreadPoolExecutor(max_workers=2) as infer_executor:
+            face_start = time.time()
+            future_face = infer_executor.submit(face_detector.detect_images, batch_images.copy())
+            future_plate = infer_executor.submit(plate_detector, batch_images.copy(),verbose=False, conf=0.5)
+            try:
+                result_time_start = time.time()
+                face_results = future_face.result()  # List of (img, boxes)
+                result_middle_time = time.time()
+                print("批处理中人脸推理总耗时: {:.2f}s".format(result_middle_time - face_start))
+                plate_results = future_plate.result()  # List of (img, boxes)
+                print("批处理中模型推理总耗时: {:.2f}s".format(time.time() - face_start))
+                
+            except Exception as e:
+                logger.error(f"并行推理出错: {e}")
+                continue
+
+        # 提取检测框（假设 detect_faces/detect_plates 返回 (image, boxes) 元组列表）
+        # 或者你也可以只返回 boxes，不返回 image（更高效）
+        # 示例格式: [(img1, [box1, box2]), ...]
+        mosaic_time_start = time.time()
+        processed_batch = []
+        for j, img in enumerate(batch_images):
+            # 获取人脸框
+            face_boxes = face_results[j][1] if isinstance(face_results[j], tuple) else []
+            # 获取车牌框
+            plate_boxes = plate_results[j][1] if isinstance(plate_results[j], tuple) else []
+
+            # 合并所有框
+            all_boxes = []
+            all_boxes.extend([(int(x1), int(y1), int(x2), int(y2)) for x1, y1, x2, y2 in face_boxes])
+            all_boxes.extend([(int(x1), int(y1), int(x2), int(y2)) for x1, y1, x2, y2 in plate_boxes])
+
+            # 打马赛克
+            img_with_mosaic = img.copy()
+            for (x1, y1, x2, y2) in all_boxes:
+                img_with_mosaic = mosaic_rectangle_region_single(img_with_mosaic, x1, y1, x2, y2, mosaic_level=8)
+
+            processed_batch.append(img_with_mosaic)
+
+            # 统计
+            total_faces += len(face_boxes)
+            total_plates += len(plate_boxes)
+        print("批处理中马赛克总耗时: {:.2f}s".format(time.time() - mosaic_time_start))
+        # 异步保存
+        save_time_start = time.time()
+        for img_path, result_img in zip(batch_files, processed_batch):
+            output_path = os.path.join(output_dir, f"processed_{os.path.basename(img_path)}")
+            future = executor.submit(save_output_image, result_img, output_path)
+            save_futures.append(future)
+        print("批处理中保存总耗时: {:.2f}s".format(time.time() - save_time_start))
+        total_processed += len(batch_files)
+        batch_time = time.time() - batch_start_time
+        print(f"批次 {i//batch_size+1} 处理完成，耗时: {batch_time:.2f}s | 处理 {len(batch_files)} 张")
+
+    # 等待所有保存完成
+    for future in as_completed(save_futures):
+        try:
+            future.result()
+        except Exception as e:
+            logger.error(f"保存图像失败: {e}")
+
+    logger.info(f"批处理完成! 共处理 {total_processed} 张图片")
+    logger.info(f"检测结果: {total_faces} 个人脸, {total_plates} 个车牌")
     return total_processed, total_faces, total_plates
 
 def convert_video_to_frames(video_path, output_dir, interval=1):
-    """将视频转换为图片帧"""
+    """WSL2 专用 GPU 抽帧函数（解决小文件 I/O 瓶颈）"""
     logger = logging.getLogger('VideoProcessor.convert_video_to_frames')
     
+    # 开始计时
+    start_time = time.time()
+    gpu_processing_time = 0  # 单独计时 GPU 处理
+    
+    # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
+    # 清空旧文件
+    for f in glob.glob(os.path.join(output_dir, '*.jpg')):
+        os.remove(f)
     
-    # 打开视频文件
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        logger.error(f"无法打开视频文件: {video_path}")
-        return 0
-    
-    # 获取视频信息
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames / fps if fps > 0 else 0
-    
-    logger.info(f"视频信息: {os.path.basename(video_path)} - "
-               f"帧率: {fps:.1f}, 总帧数: {total_frames}, 时长: {duration:.1f}秒")
-    
-    frame_count = 0
+    # 确定输出帧格式
+    output_pattern = os.path.join(output_dir, "frame_%06d.jpg")
     saved_count = 0
     
-    # 读取帧并保存
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-            
-        # 按间隔保存帧
-        if frame_count % interval == 0:
-            frame_filename = f"frame_{frame_count:06d}.jpg"
-            frame_path = os.path.join(output_dir, frame_filename)
-            cv2.imwrite(frame_path, frame)
-            saved_count += 1
-            
-        frame_count += 1
+    try:
+        # === 检测WSL2环境 ===
+        is_wsl2 = False
+        try:
+            with open('/proc/sys/kernel/osrelease', 'r') as f:
+                is_wsl2 = 'microsoft' in f.read().lower()
+        except:
+            pass
         
-        # 进度提示
-        if frame_count % 100 == 0:
-            progress = (frame_count / total_frames) * 100
-            logger.debug(f"抽帧进度: {progress:.1f}% ({frame_count}/{total_frames})")
+        # === 关键：路径处理策略 ===
+        local_temp_dir = None
+        win_video_path = video_path
+        win_output_pattern = output_pattern
+        
+        if is_wsl2 and video_path.startswith('/mnt/'):
+            logger.info("🖥️ 检测到WSL2环境，应用小文件I/O优化策略")
+            
+            # 创建临时目录（在WSL2本地）
+            local_temp_dir = "/tmp/video_processing"
+            os.makedirs(local_temp_dir, exist_ok=True)
+            
+            # 复制视频到WSL2本地
+            local_video_path = os.path.join(
+                local_temp_dir, 
+                os.path.basename(video_path)
+            )
+            if not os.path.exists(local_video_path):
+                logger.info(f"📂 复制视频到WSL2本地: {video_path} → {local_video_path}")
+                shutil.copy2(video_path, local_video_path)
+            
+            # 使用本地路径
+            win_video_path = local_video_path
+            
+            # 为输出创建本地临时目录
+            local_output_dir = os.path.join(local_temp_dir, "frames")
+            os.makedirs(local_output_dir, exist_ok=True)
+            win_output_pattern = os.path.join(local_output_dir, "frame_%06d.jpg")
+        
+        # === 检查GPU可用性 ===
+        gpu_available = False
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_available = True
+                logger.info(f"✅ 检测到GPU: {torch.cuda.get_device_name(0)} (CUDA {torch.version.cuda})")
+        except:
+            pass
+        
+        # === 构建GPU命令 ===
+        if gpu_available and is_wsl2:
+            logger.info("🔥 尝试使用NVIDIA CUDA硬件加速 (小文件I/O优化模式)...")
+            
+            gpu_command = [
+                'ffmpeg',
+                '-hide_banner', '-loglevel', 'warning',
+                '-hwaccel', 'cuda',
+                '-extra_hw_frames', '32',
+                '-c:v', 'hevc_cuvid',
+                '-i', win_video_path,
+                '-vsync', '0',
+                '-qscale:v', '2',
+                win_output_pattern
+            ]
+            
+            if interval > 1:
+                gpu_command.extend(['-vf', f'select=not(mod(n\\,{interval-1}))'])
+            
+            logger.info(f"🎬 执行GPU命令: {' '.join(gpu_command)}")
+            
+            # === 关键：单独计时GPU处理 ===
+            gpu_start = time.time()
+            try:
+                # 尝试GPU抽帧
+                result = subprocess.run(
+                    gpu_command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                
+                # 检查结果
+                saved_frames = glob.glob(win_output_pattern.replace('%06d', '*'))
+                saved_count = len(saved_frames)
+                
+                if saved_count > 0:
+                    gpu_processing_time = time.time() - gpu_start
+                    logger.info(f"⚡ GPU处理完成 (本地): {saved_count}帧/{gpu_processing_time:.2f}秒 = {saved_count/gpu_processing_time:.1f}帧/秒")
+                    
+                    # === 关键：优化复制策略 ===
+                    if is_wsl2 and video_path.startswith('/mnt/'):
+                        logger.info("💾 优化复制: 打包帧文件后一次性传输")
+                        
+                        # 打包帧文件
+                        tar_path = os.path.join(local_temp_dir, "frames.tar")
+                        with tarfile.open(tar_path, "w") as tar:
+                            for f in saved_frames:
+                                tar.add(f, arcname=os.path.basename(f))
+                        
+                        # 复制tar文件
+                        shutil.copy2(tar_path, output_dir)
+                        
+                        # 在目标目录解压
+                        with tarfile.open(os.path.join(output_dir, "frames.tar"), "r") as tar:
+                            tar.extractall(path=output_dir)
+                        
+                        # 清理
+                        os.remove(os.path.join(output_dir, "frames.tar"))
+                        shutil.rmtree(os.path.dirname(win_output_pattern), ignore_errors=True)
+                        
+                        logger.info("✅ 帧文件已优化复制到Windows目录")
+                    
+                    logger.info(f"✅ GPU抽帧成功! 共保存 {saved_count} 帧到 {output_dir}")
+                    return saved_count
+                else:
+                    logger.warning("⚠️ GPU命令执行成功但未生成帧文件")
+                    
+            except subprocess.CalledProcessError as e:
+                logger.error(f"❌ GPU抽帧失败 (返回码: {e.returncode})")
+                logger.error(f"FFmpeg错误输出:\n{e.stderr}")
+        
+        # === CPU回退 ===
+        logger.info("💻 使用CPU模式进行抽帧...")
+        cpu_command = [
+            'ffmpeg',
+            '-hide_banner', '-loglevel', 'warning',
+            '-threads', str(max(1, os.cpu_count()-2)),
+            '-i', video_path,
+            '-qscale:v', '2',
+            output_pattern
+        ]
+        
+        if interval > 1:
+            cpu_command.extend(['-vf', f'select=not(mod(n\\,{interval-1}))'])
+        
+        logger.info(f"🎬 执行CPU命令: {' '.join(cpu_command)}")
+        
+        result = subprocess.run(
+            cpu_command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        saved_frames = glob.glob(os.path.join(output_dir, '*.jpg'))
+        saved_count = len(saved_frames)
+        if saved_count > 0:
+            logger.info(f"✅ CPU抽帧完成，共保存 {saved_count} 帧到 {output_dir}")
     
-    cap.release()
-    logger.info(f"抽帧完成，共保存 {saved_count} 帧到 {output_dir}")
+    except Exception as e:
+        logger.exception(f"❌ 抽帧过程中发生致命错误: {str(e)}")
+    finally:
+        # 计算性能指标
+        end_time = time.time()
+        total_time = end_time - start_time
+        fps = saved_count / max(total_time, 0.1)
+        
+        # 生成详细性能报告
+        perf_msg = f"⏱️ 总处理时间: {total_time:.2f}秒"
+        
+        if gpu_available and gpu_processing_time > 0:
+            gpu_fps = saved_count / max(gpu_processing_time, 0.1)
+            copy_time = total_time - gpu_processing_time
+            
+            perf_msg += f"\n   ⚡ GPU处理: {gpu_processing_time:.2f}秒 ({gpu_fps:.1f}帧/秒)"
+            perf_msg += f"\n   💾 复制操作: {copy_time:.2f}秒"
+            
+            if gpu_fps > 200:
+                perf_msg += "\n   ✅ GPU加速成功!"
+            if copy_time > 3:
+                perf_msg += "\n   ⚠️ 复制操作是主要瓶颈!"
+        
+        perf_msg += f"\n   📊 最终速度: {fps:.1f}帧/秒"
+        
+        logger.info(perf_msg)
+        
     return saved_count
 
-def create_video(frame_dir, output_path, fps=30):
+
+def create_video(frame_dir, output_path, fps=60):
     """将图片帧合成为视频"""
     logger = logging.getLogger('VideoProcessor.create_video')
     
@@ -1052,8 +724,8 @@ def load_config(config_file='config.ini'):
     
     paths = config['PATHS']
     required_keys = [
-        'model_weights', 
-        'mtcnn_model_path',
+        'model_path',
+        'model_weights',
         'record_dir',
         'output_h265_dir',
         'output_videos_dir', 
@@ -1080,8 +752,8 @@ def load_config(config_file='config.ini'):
         batch_size = 16
     
     return {
+        'model_path': paths['model_path'],
         'model_weights': paths['model_weights'],
-        'mtcnn_model_path': paths['mtcnn_model_path'],
         'record_dir': paths['record_dir'],
         'output_h265_dir': paths['output_h265_dir'],
         'output_videos_dir': paths['output_videos_dir'],
@@ -1110,27 +782,12 @@ def process_mf4(file_path, output_dir):
         logger.error(f".mf4 文件处理失败: {str(e)}")
         return False
 
-# 模拟recordDeal模块（实际使用时替换为真实模块）
-class MockRecordDeal:
-    @staticmethod
-    def read_record2h265_all(input_dir, output_dir):
-        logger = logging.getLogger('VideoProcessor.MockRecordDeal')
-        logger.info(f"模拟解包record文件: {input_dir} -> {output_dir}")
-        os.makedirs(os.path.join(output_dir, "hevcs"), exist_ok=True)
-        return True
-        
-    @staticmethod
-    def write_allH265_record_all(input_dir, processed_dir, output_dir):
-        logger = logging.getLogger('VideoProcessor.MockRecordDeal')
-        logger.info(f"模拟重新打包record文件: {input_dir} + {processed_dir} -> {output_dir}")
-        os.makedirs(output_dir, exist_ok=True)
-        return True
 
 if __name__ == "__main__":
     # 初始化日志器
     logger = setup_logger('video_processing.log')
     logger.info("===== 程序启动 =====")
-    
+    starttime = time.time()
     # 记录系统基本信息
     logger.info(f"Python版本: {sys.version}")
     logger.info(f"工作目录: {os.getcwd()}")
@@ -1144,8 +801,8 @@ if __name__ == "__main__":
         logger.info("配置文件加载成功")
         
         # 获取配置参数
+        model_path = config['model_path']
         plate_model_path = config['model_weights']
-        mtcnn_model_path = config['mtcnn_model_path']
         record_dir = config['record_dir']
         output_h265_dir = config['output_h265_dir']
         output_videos_dir = config['output_videos_dir']
@@ -1159,7 +816,7 @@ if __name__ == "__main__":
         
         logger.info("配置参数:")
         logger.info(f"模型权重: {plate_model_path}")
-        logger.info(f"MTCNN模型路径: {mtcnn_model_path}")
+        logger.info(f"retinaface模型路径: {model_path}")
         logger.info(f"record输入: {record_dir}")
         logger.info(f"视频输入目录: {input_videos_dir}")
         logger.info(f"视频输出目录: {output_videos_dir}")
@@ -1178,10 +835,9 @@ if __name__ == "__main__":
         
        # 解包record文件，获取摄像头数据
         logger.info("开始解包数据...")
-        # 使用模拟的recordDeal，实际使用时替换为真实模块
-        recordDeal = MockRecordDeal()
+        unpack_time= time.time()
         result1 = recordDeal.read_record2h265_all(record_dir, output_h265_dir)
-        logger.info(f"解包完成")
+        logger.info(f"解包完成,耗时: {time.time() - unpack_time:.2f}秒")
         
         # 初始化模型
         logger.info("开始初始化检测模型...")
@@ -1196,12 +852,20 @@ if __name__ == "__main__":
             logger.info("未检测到GPU,将使用CPU")
         
         # 初始化MTCNN人脸检测模型
-        logger.info("正在加载MTCNN人脸检测模型...")
-        logger.info(f"MTCNN模型路径: {mtcnn_model_path}")
-        face_detector = MTCNN(model_path=mtcnn_model_path)
+        logger.info("正在加载retinaface人脸检测模型...")
+        logger.info(f"reitnaface模型路径: {model_path}")
+        face_detector = Retinaface(
+                                    model_path=model_path,
+                                    backbone="resnet50",
+                                    input_shape=[640, 640, 3],
+                                    confidence=0.5,
+                                    nms_iou=0.4,
+                                    letterbox_image=True,
+                                    cuda=True  # 自动使用 GPU
+                                )
         device = face_detector.device
         print(f"face模型运行设备: {device}")
-        logger.info("MTCNN人脸检测模型加载完成")
+        logger.info("retinaface人脸检测模型加载完成")
         
         # 初始化YOLOv8车牌检测模型
         logger.info("正在加载YOLOv8车牌检测模型...")
@@ -1210,7 +874,7 @@ if __name__ == "__main__":
         # 检查YOLOv8使用的设备
         if torch.cuda.is_available():
             yolo_device = next(plate_detector.model.parameters()).device
-            logger.info(f"YOLOv8车牌检测模型是否运行在GPU: {yolo_device}")
+            logger.info(f"YOLOv8车牌检测模型运行在 GPU: {yolo_device}")
         else:
             logger.info("YOLOv8车牌检测模型运行在: CPU")
         
@@ -1290,8 +954,9 @@ if __name__ == "__main__":
         logger.info(f"\n模型运行总耗时: {total_model_time:.2f}秒")
         # record文件打包
         logger.info("开始重新打包record文件...")
+        pack_time = time.time()
         result2 = recordDeal.write_allH265_record_all(record_dir, output_videos_dir, record_output_dir)
-        logger.info(f"打包完成")
+        logger.info(f"打包完成, 耗时: {time.time() - pack_time:.2f}秒")
         
         # 最终统计信息
         logger.info("\n===== 处理完成! 最终统计 =====")
@@ -1321,3 +986,5 @@ if __name__ == "__main__":
         if 'logger' in locals():
             logger.exception("程序发生致命错误:")
         sys.exit(1)
+    endtime = time.time()
+    logger.info(f"总耗时: {endtime - starttime:.1f}秒")

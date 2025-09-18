@@ -23,4 +23,7 @@ Blur the faces and license plates in the video.
     sudo apt install ffmpeg
     ffmpeg -version
 
+# face model_path
+    推理所需的Retinaface_resnet50.pth等文件可以在百度云下载。
+    链接: https://pan.baidu.com/s/1Jt9Bo2UVP03bmEMuUpk_9Q 提取码: qknw
 
